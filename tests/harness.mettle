@@ -1,0 +1,57 @@
+// tests/harness: an embedded meodb server for the test programs, started the
+// way meodb's own tests do it (tests/srv_smoke.mettle in the meodb package):
+// open a database file, meo_srv_start on port 0, read the port back.
+// No external process and no fixed port, so `mbuild test` needs no setup.
+
+import "std/io";
+import "std/mem";
+import "meodb/src/meo_server";
+
+var g_th_db: MeoDb* = 0;
+var g_th_srv: MeoSrv* = 0;
+var g_th_fail: int32 = 0;
+
+/// Counts a failed check and prints it.
+export fn th_check(name: string, ok: bool) {
+  if (!ok) {
+    g_th_fail = g_th_fail + 1;
+    println("FAIL " + name);
+  }
+}
+
+/// Failed checks so far.
+export fn th_failures() -> int32 { return g_th_fail; }
+
+/// Starts a fresh empty database at `path` and a server on 127.0.0.1, port
+/// chosen by the OS. Returns "127.0.0.1:PORT" (heap string) or "" on failure.
+export fn th_start(path: string) -> string {
+  meo_file_unlink(path);
+  meo_file_unlink(path + "-journal");
+  var rc: int32 = meo_db_open(path, MEO_OPEN_CREATE | MEO_OPEN_READ | MEO_OPEN_WRITE, 0, &g_th_db);
+  if (rc != MEO_OK) {
+    println("FAIL harness: db open rc={rc}");
+    return "";
+  }
+  var c: MeoSrvConfig;
+  meo_srv_config_default(&c);
+  c.port = 0;
+  rc = meo_srv_start(g_th_db, &c, &g_th_srv);
+  if (rc != MEO_OK) {
+    println("FAIL harness: server start rc={rc}");
+    return "";
+  }
+  return "127.0.0.1:{meo_srv_port(g_th_srv)}";
+}
+
+/// Stops the server and closes the database. Call after fd_db_close.
+export fn th_stop() {
+  if (g_th_srv != 0) {
+    meo_srv_stop(g_th_srv);
+    meo_srv_free(g_th_srv);
+    g_th_srv = 0;
+  }
+  if (g_th_db != 0) {
+    meo_db_close(g_th_db);
+    g_th_db = 0;
+  }
+}

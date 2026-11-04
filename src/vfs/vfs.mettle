@@ -1,0 +1,364 @@
+// freedrs/vfs/vfs: the virtual file system.
+//
+// File bytes live under a root directory on disk (std/file, std/dir); the
+// metadata (path, kind, size, owner, created, modified) lives in MeoDB through
+// flux_orm (db/store.mettle: fd_entry_*). A virtual path is a normalised,
+// slash separated string without a leading slash ("" is the root, "docs/a.txt"
+// a file), at most FD_PATH_MAX bytes.
+//
+// fd_vfs_resolve turns what a client typed (absolute or relative to its working
+// directory) into a virtual path. It is the only way in, and it cannot produce a
+// path that leaves the root: "." and empty segments are dropped, ".." pops a
+// segment and is an error (FD_E_TRAVERSAL) when there is nothing to pop, and
+// backslashes, control characters and NUL are refused. The disk path is
+// root + "/" + virtual path.
+//
+// One mutex serialises every operation that changes or reads the tree, so
+// check-then-act sequences (exists, then write) are not interleaved.
+//
+// MeoDB is the only source of the entry list: files that appear under the root
+// without going through the server are not adopted into the metadata.
+// TODO: adopt existing files once std/dir can iterate a directory.
+// TODO: remove the directory itself once std/file has rmdir; deleting a
+// directory currently removes only its metadata.
+
+import "std/mem";
+import "std/conv";
+import "std/file";
+import "std/dir";
+import "std/sync";
+import "freedrs/status";
+import "freedrs/auth/roles";
+import "freedrs/db/store";
+import "freedrs/db/models";
+
+/// Largest file accepted by fd_vfs_write, in bytes.
+export const FD_VFS_MAX_FILE: int64 = 16777216;
+const FD_ROOT_CAP: int32 = 256;
+const FD_DISK_CAP: int32 = 1024;
+
+export struct FdVfs {
+  db: FdDb*;
+  root: uint8[256];
+  root_len: int32;
+  lock: SyncMutex;
+}
+
+/// A virtual path in a fixed buffer.
+export struct FdVPath {
+  buf: uint8[512];
+  len: int32;
+}
+
+export fn fd_vpath_str(p: FdVPath*) -> string {
+  return str_from_bytes((cstring)&p->buf[0], (int64)p->len);
+}
+
+fn fd_vp_push(p: FdVPath*, seg_start: int64, seg: string) -> bool {
+  var need: int64 = (int64)seg.length;
+  if (p->len > 0) { need = need + 1; }
+  if ((int64)p->len + need > (int64)FD_PATH_MAX) { return false; }
+  if (p->len > 0) { p->buf[p->len] = (uint8)'/'; p->len = p->len + 1; }
+  memcpy((rawptr)&p->buf[p->len], (rawptr)seg.chars, (int64)seg.length);
+  p->len = p->len + (int32)seg.length;
+  return true;
+}
+
+// Removes the last segment. False when the path is already the root.
+fn fd_vp_pop(p: FdVPath*) -> bool {
+  if (p->len == 0) { return false; }
+  var i: int32 = p->len - 1;
+  while (i >= 0 && p->buf[i] != (uint8)'/') { i = i - 1; }
+  if (i < 0) { p->len = 0; } else { p->len = i; }
+  return true;
+}
+
+fn fd_seg_ok(seg: string) -> bool {
+  var i: int64 = 0;
+  while (i < (int64)seg.length) {
+    var c: int32 = (int32)(uint8)seg.chars[i];
+    if (c < 32 || c == 127 || c == 92) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+// Applies the segments of `s` onto `out` (see fd_vfs_resolve).
+fn fd_vp_apply(out: FdVPath*, s: string) -> int32 {
+  var n: int64 = (int64)s.length;
+  var start: int64 = 0;
+  var i: int64 = 0;
+  while (i <= n) {
+    if (i == n || s.chars[i] == '/') {
+      var seg: string = str_slice(s, start, i - start);
+      start = i + 1;
+      if (seg.length == 0 || seg == ".") {
+        // nothing
+      } else if (seg == "..") {
+        if (!fd_vp_pop(out)) { return FD_E_TRAVERSAL; }
+      } else {
+        if (!fd_seg_ok(seg)) { return FD_E_TRAVERSAL; }
+        if (!fd_vp_push(out, 0, seg)) { return FD_E_INVALID; }
+      }
+    }
+    i = i + 1;
+  }
+  return FD_OK;
+}
+
+/// Resolves `input` against the working directory `cwd` ("/" or "/a/b").
+/// A leading slash makes `input` absolute. The result is a clean virtual path.
+///
+/// returns: FD_OK; FD_E_TRAVERSAL (escapes the root, bad character);
+///          FD_E_INVALID (empty input or too long)
+export fn fd_vfs_resolve(cwd: string, input: string, out: FdVPath*) -> int32 {
+  if (out == 0) { return FD_E_USAGE; }
+  out->len = 0;
+  var s: string = str_trim(input);
+  if (s.length == 0) { return FD_E_INVALID; }
+  var rc: int32 = FD_OK;
+  if (s.chars[0] != '/') {
+    rc = fd_vp_apply(out, cwd);
+    if (rc != FD_OK) { return rc; }
+  }
+  return fd_vp_apply(out, s);
+}
+
+/// Like fd_vfs_resolve, but an empty `input` means the working directory itself.
+export fn fd_vfs_resolve_or_cwd(cwd: string, input: string, out: FdVPath*) -> int32 {
+  if (str_trim(input).length == 0) {
+    if (out == 0) { return FD_E_USAGE; }
+    out->len = 0;
+    return fd_vp_apply(out, cwd);
+  }
+  return fd_vfs_resolve(cwd, input, out);
+}
+
+// ---- disk paths ----
+
+struct FdDiskPath {
+  buf: uint8[1024];
+  len: int32;
+}
+
+fn fd_disk_str(d: FdDiskPath*) -> string {
+  return str_from_bytes((cstring)&d->buf[0], (int64)d->len);
+}
+
+// root + "/" + vpath (+ NUL after len, for the cstring dir calls).
+fn fd_disk_path(v: FdVfs*, vpath: string, d: FdDiskPath*) -> bool {
+  var total: int64 = (int64)v->root_len + 1 + (int64)vpath.length;
+  if (total >= (int64)FD_DISK_CAP) { return false; }
+  memcpy((rawptr)&d->buf[0], (rawptr)&v->root[0], (int64)v->root_len);
+  var n: int32 = v->root_len;
+  if (vpath.length > 0) {
+    d->buf[n] = (uint8)'/';
+    n = n + 1;
+    memcpy((rawptr)&d->buf[n], (rawptr)vpath.chars, (int64)vpath.length);
+    n = n + (int32)vpath.length;
+  }
+  d->buf[n] = (uint8)0;
+  d->len = n;
+  return true;
+}
+
+// Creates `disk` and every missing parent. Existing directories are fine.
+fn fd_mkdir_p(disk: string) -> int32 {
+  var tmp: uint8[1024];
+  var n: int64 = (int64)disk.length;
+  if (n >= 1024) { return FD_E_INVALID; }
+  var i: int64 = 1;
+  while (i <= n) {
+    if (i == n || disk.chars[i] == '/') {
+      memcpy((rawptr)&tmp[0], (rawptr)disk.chars, i);
+      tmp[i] = (uint8)0;
+      if (dir_exists((cstring)&tmp[0]) == 0) {
+        if (dir_create((cstring)&tmp[0]) != 0 && dir_exists((cstring)&tmp[0]) == 0) { return FD_E_IO; }
+      }
+    }
+    i = i + 1;
+  }
+  return FD_OK;
+}
+
+// The directory part of a virtual path ("" for a top-level name).
+fn fd_vpath_parent(vpath: string) -> string {
+  var i: int64 = (int64)vpath.length - 1;
+  while (i >= 0 && vpath.chars[i] != '/') { i = i - 1; }
+  if (i < 0) { return ""; }
+  return str_slice(vpath, 0, i);
+}
+
+// ---- operations ----
+
+/// Opens the VFS over root (created when missing, with parents).
+/// returns: FD_OK; FD_E_INVALID (root empty or too long); FD_E_IO
+export fn fd_vfs_init(v: FdVfs*, db: FdDb*, root: string) -> int32 {
+  if (v == 0 || db == 0) { return FD_E_USAGE; }
+  if (root.length == 0 || (int64)root.length >= (int64)FD_ROOT_CAP) { return FD_E_INVALID; }
+  memset((rawptr)v, 0, (int64)sizeof(FdVfs));
+  v->db = db;
+  memcpy((rawptr)&v->root[0], (rawptr)root.chars, (int64)root.length);
+  v->root_len = (int32)root.length;
+  // a trailing slash would double up in disk paths
+  while (v->root_len > 1 && v->root[v->root_len - 1] == (uint8)'/') { v->root_len = v->root_len - 1; }
+  return fd_mkdir_p(str_from_bytes((cstring)&v->root[0], (int64)v->root_len));
+}
+
+/// Creates a directory entry (and the directory on disk, with parents).
+/// returns: FD_OK; FD_E_EXISTS; FD_E_INVALID (root, or a file is in the way); FD_E_IO; FD_E_DB
+export fn fd_vfs_mkdir(v: FdVfs*, vpath: string, owner: string) -> int32 {
+  if (v == 0 || vpath.length == 0) { return FD_E_INVALID; }
+  var d: FdDiskPath;
+  if (!fd_disk_path(v, vpath, &d)) { return FD_E_INVALID; }
+  sync_mutex_lock(&v->lock);
+  var e: FdEntryInfo;
+  var rc: int32 = fd_entry_get(v->db, vpath, &e);
+  if (rc == FD_OK) { sync_mutex_unlock(&v->lock); return FD_E_EXISTS; }
+  if (rc != FD_E_NOT_FOUND) { sync_mutex_unlock(&v->lock); return rc; }
+  rc = fd_mkdir_p(fd_disk_str(&d));
+  if (rc == FD_OK) { rc = fd_entry_add(v->db, vpath, FD_KIND_DIR, 0, owner); }
+  sync_mutex_unlock(&v->lock);
+  return rc;
+}
+
+/// Writes (creates or replaces) a file: bytes to disk, entry to MeoDB.
+/// returns: FD_OK; FD_E_TOO_BIG; FD_E_INVALID (a directory is there, or the
+///          path is the root); FD_E_IO; FD_E_DB
+export fn fd_vfs_write(v: FdVfs*, vpath: string, data: uint8*, n: int64, owner: string) -> int32 {
+  if (v == 0 || vpath.length == 0 || n < 0) { return FD_E_INVALID; }
+  if (n > FD_VFS_MAX_FILE) { return FD_E_TOO_BIG; }
+  var d: FdDiskPath;
+  if (!fd_disk_path(v, vpath, &d)) { return FD_E_INVALID; }
+  var pd: FdDiskPath;
+  if (!fd_disk_path(v, fd_vpath_parent(vpath), &pd)) { return FD_E_INVALID; }
+  sync_mutex_lock(&v->lock);
+  var e: FdEntryInfo;
+  var rc: int32 = fd_entry_get(v->db, vpath, &e);
+  var exists: bool = rc == FD_OK;
+  if (exists && e.kind == FD_KIND_DIR) { sync_mutex_unlock(&v->lock); return FD_E_INVALID; }
+  if (!exists && rc != FD_E_NOT_FOUND) { sync_mutex_unlock(&v->lock); return rc; }
+  rc = fd_mkdir_p(fd_disk_str(&pd));
+  if (rc != FD_OK) { sync_mutex_unlock(&v->lock); return rc; }
+  var fd: int64 = file_open(fd_disk_str(&d), FILE_WRITE | FILE_CREATE | FILE_TRUNCATE);
+  if (fd < 0) { sync_mutex_unlock(&v->lock); return FD_E_IO; }
+  var off: int64 = 0;
+  while (off < n) {
+    var w: int64 = file_write_at(fd, data + off, n - off, off);
+    if (w <= 0) { file_close(fd); sync_mutex_unlock(&v->lock); return FD_E_IO; }
+    off = off + w;
+  }
+  file_close(fd);
+  if (exists) { rc = fd_entry_touch(v->db, vpath, n); }
+  else { rc = fd_entry_add(v->db, vpath, FD_KIND_FILE, n, owner); }
+  sync_mutex_unlock(&v->lock);
+  return rc;
+}
+
+/// The size of a file entry, for sizing a read buffer.
+/// returns: FD_OK; FD_E_NOT_FOUND (no entry, or a directory)
+export fn fd_vfs_size(v: FdVfs*, vpath: string, size: int64*) -> int32 {
+  if (v == 0 || size == 0 || vpath.length == 0) { return FD_E_USAGE; }
+  var e: FdEntryInfo;
+  var rc: int32 = fd_entry_get(v->db, vpath, &e);
+  if (rc != FD_OK) { return rc; }
+  if (e.kind != FD_KIND_FILE) { return FD_E_NOT_FOUND; }
+  *size = e.size;
+  return FD_OK;
+}
+
+/// Reads a file into buf (capacity cap), setting *n.
+/// returns: FD_OK; FD_E_NOT_FOUND; FD_E_TOO_BIG (cap too small); FD_E_IO
+export fn fd_vfs_read(v: FdVfs*, vpath: string, buf: uint8*, cap: int64, n: int64*) -> int32 {
+  if (v == 0 || buf == 0 || n == 0 || vpath.length == 0) { return FD_E_USAGE; }
+  var d: FdDiskPath;
+  if (!fd_disk_path(v, vpath, &d)) { return FD_E_INVALID; }
+  sync_mutex_lock(&v->lock);
+  var e: FdEntryInfo;
+  var rc: int32 = fd_entry_get(v->db, vpath, &e);
+  if (rc != FD_OK || e.kind != FD_KIND_FILE) {
+    sync_mutex_unlock(&v->lock);
+    if (rc == FD_OK) { return FD_E_NOT_FOUND; }
+    return rc;
+  }
+  var fd: int64 = file_open(fd_disk_str(&d), FILE_READ);
+  if (fd < 0) { sync_mutex_unlock(&v->lock); return FD_E_NOT_FOUND; }
+  var size: int64 = file_size(fd);
+  if (size < 0) { file_close(fd); sync_mutex_unlock(&v->lock); return FD_E_IO; }
+  if (size > cap) { file_close(fd); sync_mutex_unlock(&v->lock); return FD_E_TOO_BIG; }
+  var off: int64 = 0;
+  while (off < size) {
+    var r: int64 = file_read_at(fd, buf + off, size - off, off);
+    if (r <= 0) { break; }
+    off = off + r;
+  }
+  file_close(fd);
+  sync_mutex_unlock(&v->lock);
+  if (off != size) { return FD_E_IO; }
+  *n = size;
+  return FD_OK;
+}
+
+/// Deletes a file or an empty directory.
+/// `user` and `is_admin` decide ownership: only the owner or an admin may.
+/// returns: FD_OK; FD_E_NOT_FOUND; FD_E_DENIED; FD_E_NOT_EMPTY; FD_E_IO; FD_E_DB
+export fn fd_vfs_delete(v: FdVfs*, vpath: string, user: string, is_admin: bool) -> int32 {
+  if (v == 0 || vpath.length == 0) { return FD_E_INVALID; }
+  var d: FdDiskPath;
+  if (!fd_disk_path(v, vpath, &d)) { return FD_E_INVALID; }
+  sync_mutex_lock(&v->lock);
+  var e: FdEntryInfo;
+  var rc: int32 = fd_entry_get(v->db, vpath, &e);
+  if (rc != FD_OK) { sync_mutex_unlock(&v->lock); return rc; }
+  if (!is_admin && fd_entry_info_owner(&e) != user) { sync_mutex_unlock(&v->lock); return FD_E_DENIED; }
+  if (e.kind == FD_KIND_DIR) {
+    var kids: FdEntryInfo[1];
+    var n: int32 = 0;
+    var pbuf: uint8[520];
+    memcpy((rawptr)&pbuf[0], (rawptr)vpath.chars, (int64)vpath.length);
+    pbuf[(int64)vpath.length] = (uint8)'/';
+    var prefix: string = str_from_bytes((cstring)&pbuf[0], (int64)vpath.length + 1);
+    rc = fd_entry_list(v->db, prefix, &kids[0], 1, &n);
+    if (rc != FD_OK) { sync_mutex_unlock(&v->lock); return rc; }
+    if (n > 0) { sync_mutex_unlock(&v->lock); return FD_E_NOT_EMPTY; }
+    // TODO: remove the directory once std/file has rmdir.
+  } else {
+    var r: int64 = file_remove(fd_disk_str(&d));
+    if (r < 0 && r != -(int64)FILE_ENOENT) { sync_mutex_unlock(&v->lock); return FD_E_IO; }
+  }
+  rc = fd_entry_delete(v->db, vpath);
+  sync_mutex_unlock(&v->lock);
+  return rc;
+}
+
+// ---- tests (no database needed) ----
+
+fn t_resolve(cwd: string, input: string, want: string) -> bool {
+  var p: FdVPath;
+  if (fd_vfs_resolve(cwd, input, &p) != FD_OK) { return false; }
+  return fd_vpath_str(&p) == want;
+}
+
+@test fn t_resolve_basic() -> int32 {
+  if (!t_resolve("/", "a.txt", "a.txt")) { return 1; }
+  if (!t_resolve("/docs", "a.txt", "docs/a.txt")) { return 2; }
+  if (!t_resolve("/docs", "/a.txt", "a.txt")) { return 3; }
+  if (!t_resolve("/", "a//b/./c", "a/b/c")) { return 4; }
+  if (!t_resolve("/a/b", "..", "a")) { return 5; }
+  if (!t_resolve("/a/b", "../../x", "x")) { return 6; }
+  if (!t_resolve("/", "/", "")) { return 7; }
+  if (!t_resolve("/", "with space.txt", "with space.txt")) { return 8; }
+  return 0;
+}
+
+@test fn t_resolve_traversal() -> int32 {
+  var p: FdVPath;
+  if (fd_vfs_resolve("/", "..", &p) != FD_E_TRAVERSAL) { return 1; }
+  if (fd_vfs_resolve("/", "../etc/passwd", &p) != FD_E_TRAVERSAL) { return 2; }
+  if (fd_vfs_resolve("/a", "../../x", &p) != FD_E_TRAVERSAL) { return 3; }
+  if (fd_vfs_resolve("/", "/a/../../x", &p) != FD_E_TRAVERSAL) { return 4; }
+  if (fd_vfs_resolve("/", "a\\b", &p) != FD_E_TRAVERSAL) { return 5; }
+  if (fd_vfs_resolve("/", "", &p) != FD_E_INVALID) { return 6; }
+  if (fd_vfs_resolve_or_cwd("/x", "", &p) != FD_OK || fd_vpath_str(&p) != "x") { return 7; }
+  return 0;
+}

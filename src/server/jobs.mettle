@@ -1,0 +1,98 @@
+// freedrs/server/jobs: the blocking work of a session, run on alph's worker pool
+// (alph_offload) so session handlers never wait on meodb, Argon2id or the disk.
+//
+// A job is one function, fd_job_run, over bytes: the input is an FdJobIn header
+// followed by text; the result is an FdJobOut header followed by reply text and
+// bulk bytes. Ownership follows alph's rules: the session actor keeps its state;
+// the job gets a copy of what it needs (the FdSess, the line, the upload data)
+// and returns copies (the new FdSess, the reply). Nothing points across heaps.
+//
+//   JOB_LOGIN / JOB_SIGNUP  text = user, then password (user_len says where)
+//   JOB_CMD                 text = the command line
+//   JOB_UPLOAD              text = the collected base64 upload data
+//
+// Globals g_db, g_auth, g_vfs are shared by every worker (their pools and
+// locks make that safe).
+
+import "std/mem";
+import "std/arena";
+import "std/strbuf";
+import "alph/alph";
+import "freedrs/status";
+import "freedrs/auth/auth";
+import "freedrs/db/store";
+import "freedrs/server/state";
+import "freedrs/server/cmds";
+
+export const JOB_LOGIN: int32 = 1;
+export const JOB_SIGNUP: int32 = 2;
+export const JOB_CMD: int32 = 3;
+export const JOB_UPLOAD: int32 = 4;
+
+/// Input header; `len` bytes of text follow it.
+export struct FdJobIn {
+  kind: int32;
+  over: bool;        // JOB_UPLOAD: the upload was cut off (too big)
+  user_len: int64;   // JOB_LOGIN / JOB_SIGNUP: bytes of user name in the text
+  len: int64;
+  sess: FdSess;      // a copy of the session's state (JOB_CMD, JOB_UPLOAD)
+}
+
+/// Result header; `reply_len` bytes of reply text, then `bulk_len` bytes of
+/// bulk (a download's base64) follow it.
+export struct FdJobOut {
+  rc: int32;           // JOB_LOGIN / JOB_SIGNUP: an FD_ status
+  user: FdUserInfo;    // JOB_LOGIN: the user
+  sess: FdSess;        // the session's new state (JOB_CMD, JOB_UPLOAD); bulk is not valid
+  reply_len: int64;
+  bulk_len: int64;
+}
+
+fn put_out(out: AlphOut*, p: rawptr, n: int64) -> bool {
+  if (n <= 0) { return true; }
+  return alph_out_bytes(out, p, n);
+}
+
+/// The work function for alph_offload. Returns 0 (the result is in `out`), or 1
+/// when it could not be built (no memory).
+export fn fd_job_run(input: rawptr, size: int64, out: AlphOut*) -> int64 {
+  var ji: FdJobIn* = (FdJobIn*)input;
+  var text: string = str_from_bytes((cstring)((uint8*)input + (int64)sizeof(FdJobIn)), ji->len);
+  var res: FdJobOut;
+  memset((rawptr)&res, 0, (int64)sizeof(FdJobOut));
+
+  if (ji->kind == JOB_LOGIN || ji->kind == JOB_SIGNUP) {
+    var user: string = str_from_bytes((cstring)text.chars, ji->user_len);
+    var pw: string = str_from_bytes((cstring)((uint8*)text.chars + ji->user_len), ji->len - ji->user_len);
+    if (ji->kind == JOB_LOGIN) {
+      res.rc = fd_auth_login(&g_auth, user, pw, &res.user);
+    } else {
+      var created: FdUserInfo;
+      res.rc = fd_auth_signup(&g_auth, user, pw, &created);
+    }
+    if (!put_out(out, (rawptr)&res, (int64)sizeof(FdJobOut))) { return 1; }
+    return 0;
+  }
+
+  var a: Arena* = arena_init(65536);
+  if (a == 0) { return 1; }
+  var b: StrBuf* = strbuf_new(a, 1024);
+  memcpy((rawptr)&res.sess, (rawptr)&ji->sess, (int64)sizeof(FdSess));
+  if (ji->kind == JOB_UPLOAD) {
+    fd_cmd_upload_finish(&res.sess, text, ji->over, b, a);
+    res.sess.action = FD_ACT_NONE;
+  } else {
+    fd_cmd_run(&res.sess, text, b, a);
+  }
+  res.reply_len = b->len;
+  var bulk: uint8* = res.sess.bulk;
+  if (res.sess.action == FD_ACT_BULK) { res.bulk_len = res.sess.bulk_len; }
+  res.sess.bulk = 0;
+  res.sess.bulk_len = 0;
+  var ok: bool = put_out(out, (rawptr)&res, (int64)sizeof(FdJobOut));
+  if (ok) { ok = put_out(out, (rawptr)b->data, b->len); }
+  if (ok && res.bulk_len > 0) { ok = put_out(out, (rawptr)bulk, res.bulk_len); }
+  arena_free(a);
+  if (!ok) { return 1; }
+  return 0;
+}

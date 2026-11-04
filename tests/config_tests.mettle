@@ -1,0 +1,87 @@
+// tests/config_tests: server_config.json parsing with the registry json
+// reader (@test functions, run by `mbuild test` in the interpreter). Reading
+// the file from disk is not tested; only parsing is.
+
+import "std/conv";
+import "freedrs/status";
+import "freedrs/config/config";
+
+@test fn t_config_defaults() -> int32 {
+  var c: FdConfig;
+  fd_config_defaults(&c);
+  if (c.port != 5555) { return 1; }
+  if (fd_config_root(&c) != "dfs_root") { return 2; }
+  if (fd_config_meodb(&c) != "127.0.0.1:5490") { return 3; }
+  if (fd_config_admin_user(&c) != "admin") { return 4; }
+  return 0;
+}
+
+@test fn t_config_parse_full() -> int32 {
+  var c: FdConfig;
+  fd_config_defaults(&c);
+  var doc: string = "{{ \"port\": 6000, \"resourcesPath\": \"/srv/dfs\", \"meodb\": \"10.0.0.5:5490\", \"adminUser\": \"root\" }";
+  if (fd_config_parse(&c, doc) != FD_OK) { return 1; }
+  if (c.port != 6000) { return 2; }
+  if (fd_config_root(&c) != "/srv/dfs") { return 3; }
+  if (fd_config_meodb(&c) != "10.0.0.5:5490") { return 4; }
+  if (fd_config_admin_user(&c) != "root") { return 5; }
+  return 0;
+}
+
+// A document with a nested "db" object, an adminPass (ignored) and unknown keys
+// of every shape.
+@test fn t_config_parse_nested() -> int32 {
+  var c: FdConfig;
+  fd_config_defaults(&c);
+  var doc: string = "{{\"port\":5556,\"resourcesPath\":\"dfs_root\",\"db\":{{\"sqlitePath\":\"dfs_database.db\",\"x\":[1,2,{{\"y\":null}]},\"adminUser\":\"admin\",\"adminPass\":\"secret\",\"extra\":true}";
+  if (fd_config_parse(&c, doc) != FD_OK) { return 1; }
+  if (c.port != 5556) { return 2; }
+  if (fd_config_meodb(&c) != "127.0.0.1:5490") { return 3; }
+  return 0;
+}
+
+@test fn t_config_partial_keeps_defaults() -> int32 {
+  var c: FdConfig;
+  fd_config_defaults(&c);
+  if (fd_config_parse(&c, "{{\"port\": 7000}") != FD_OK) { return 1; }
+  if (c.port != 7000) { return 2; }
+  if (fd_config_root(&c) != "dfs_root") { return 3; }
+  if (fd_config_parse(&c, "{{}") != FD_OK) { return 4; }
+  if (c.port != 7000) { return 5; }
+  return 0;
+}
+
+@test fn t_config_escapes() -> int32 {
+  var c: FdConfig;
+  fd_config_defaults(&c);
+  if (fd_config_parse(&c, "{{\"resourcesPath\": \"a\\\\b\\u0041\"}") != FD_OK) { return 1; }
+  if (fd_config_root(&c) != "a\\bA") { return 2; }
+  return 0;
+}
+
+@test fn t_config_rejects_bad_input() -> int32 {
+  var c: FdConfig;
+  fd_config_defaults(&c);
+  if (fd_config_parse(&c, "") != FD_E_INVALID) { return 1; }
+  if (fd_config_parse(&c, "[1,2]") != FD_E_INVALID) { return 2; }
+  if (fd_config_parse(&c, "{{\"port\": 0}") != FD_E_INVALID) { return 3; }
+  if (fd_config_parse(&c, "{{\"port\": 70000}") != FD_E_INVALID) { return 4; }
+  if (fd_config_parse(&c, "{{\"port\": \"5555\"}") != FD_E_INVALID) { return 5; }
+  if (fd_config_parse(&c, "{{\"port\": 5555.5}") != FD_E_INVALID) { return 6; }
+  if (fd_config_parse(&c, "{{\"resourcesPath\": \"\"}") != FD_E_INVALID) { return 7; }
+  if (fd_config_parse(&c, "{{\"port\": 6000,}") != FD_E_INVALID) { return 8; }
+  if (fd_config_parse(&c, "{{\"port\": 6000} trailing") != FD_E_INVALID) { return 9; }
+  if (fd_config_parse(&c, "{{\"port\": 6000") != FD_E_INVALID) { return 10; }
+  // a failed parse changes nothing
+  if (c.port != 5555) { return 11; }
+  return 0;
+}
+
+@test fn t_config_set_meodb() -> int32 {
+  var c: FdConfig;
+  fd_config_defaults(&c);
+  if (fd_config_set_meodb(&c, "") != FD_E_INVALID) { return 1; }
+  if (fd_config_set_meodb(&c, "127.0.0.1:9999") != FD_OK) { return 2; }
+  if (fd_config_meodb(&c) != "127.0.0.1:9999") { return 3; }
+  return 0;
+}

@@ -1,0 +1,132 @@
+// freedrs/server/state: what every session shares, as module globals set up
+// once by main before the first session starts and read-only after that
+// (the database pool, the VFS and the client registry carry their own locks).
+//
+// The client registry lists the connected sessions: id,
+// the session actor's pid (for kick: a message to that actor), user, role and
+// connect time. One mutex guards it (sessions run on several scheduler threads).
+
+import "std/mem";
+import "std/conv";
+import "std/time";
+import "std/sync";
+import "freedrs/config/config";
+import "freedrs/db/store";
+import "freedrs/auth/auth";
+import "freedrs/vfs/vfs";
+
+export var g_cfg: FdConfig;
+export var g_db: FdDb;
+export var g_auth: FdAuth;
+export var g_vfs: FdVfs;
+
+export const FD_MAX_CLIENTS: int32 = 1024;
+
+export struct FdClient {
+  used: bool;
+  id: int64;
+  pid: int64;    // the session actor's pid, for kick
+  user: uint8[64];
+  user_len: int32;
+  role: uint8[64];
+  role_len: int32;
+  connected: int64;   // unix seconds
+}
+
+var g_clients: FdClient[1024];
+var g_clients_lock: SyncMutex;
+var g_next_client: int64 = 1;
+
+export fn fd_client_user(c: FdClient*) -> string {
+  return str_from_bytes((cstring)&c->user[0], (int64)c->user_len);
+}
+export fn fd_client_role(c: FdClient*) -> string {
+  return str_from_bytes((cstring)&c->role[0], (int64)c->role_len);
+}
+
+/// Adds a session. returns its id (1, 2, ...), or 0 when the table is full.
+export fn fd_clients_register(pid: int64, user: string, role: string) -> int64 {
+  sync_mutex_lock(&g_clients_lock);
+  var i: int32 = 0;
+  var id: int64 = 0;
+  while (i < FD_MAX_CLIENTS) {
+    if (!g_clients[i].used) {
+      var c: FdClient* = &g_clients[i];
+      memset((rawptr)c, 0, (int64)sizeof(FdClient));
+      c->used = true;
+      c->id = g_next_client;
+      g_next_client = g_next_client + 1;
+      c->pid = pid;
+      var un: int64 = (int64)user.length;
+      if (un > 64) { un = 64; }
+      memcpy((rawptr)&c->user[0], (rawptr)user.chars, un);
+      c->user_len = (int32)un;
+      var rn: int64 = (int64)role.length;
+      if (rn > 64) { rn = 64; }
+      memcpy((rawptr)&c->role[0], (rawptr)role.chars, rn);
+      c->role_len = (int32)rn;
+      c->connected = time_unix();
+      id = c->id;
+      break;
+    }
+    i = i + 1;
+  }
+  sync_mutex_unlock(&g_clients_lock);
+  return id;
+}
+
+/// Removes a session. Unknown ids are ignored.
+export fn fd_clients_unregister(id: int64) {
+  sync_mutex_lock(&g_clients_lock);
+  var i: int32 = 0;
+  while (i < FD_MAX_CLIENTS) {
+    if (g_clients[i].used && g_clients[i].id == id) { g_clients[i].used = false; break; }
+    i = i + 1;
+  }
+  sync_mutex_unlock(&g_clients_lock);
+}
+
+/// Removes the session of this actor (the acceptor does this when a session
+/// actor dies without unregistering itself, e.g. a crash). Unknown pids are ignored.
+export fn fd_clients_unregister_pid(pid: int64) {
+  sync_mutex_lock(&g_clients_lock);
+  var i: int32 = 0;
+  while (i < FD_MAX_CLIENTS) {
+    if (g_clients[i].used && g_clients[i].pid == pid) { g_clients[i].used = false; break; }
+    i = i + 1;
+  }
+  sync_mutex_unlock(&g_clients_lock);
+}
+
+/// Copies the session with this id into out. returns false when none.
+export fn fd_clients_find(id: int64, out: FdClient*) -> bool {
+  var found: bool = false;
+  sync_mutex_lock(&g_clients_lock);
+  var i: int32 = 0;
+  while (i < FD_MAX_CLIENTS) {
+    if (g_clients[i].used && g_clients[i].id == id) {
+      memcpy((rawptr)out, (rawptr)&g_clients[i], (int64)sizeof(FdClient));
+      found = true;
+      break;
+    }
+    i = i + 1;
+  }
+  sync_mutex_unlock(&g_clients_lock);
+  return found;
+}
+
+/// Copies up to cap sessions, in id order of the table, into out. returns the count.
+export fn fd_clients_snapshot(out: FdClient*, cap: int32) -> int32 {
+  var n: int32 = 0;
+  sync_mutex_lock(&g_clients_lock);
+  var i: int32 = 0;
+  while (i < FD_MAX_CLIENTS && n < cap) {
+    if (g_clients[i].used) {
+      memcpy((rawptr)&out[n], (rawptr)&g_clients[i], (int64)sizeof(FdClient));
+      n = n + 1;
+    }
+    i = i + 1;
+  }
+  sync_mutex_unlock(&g_clients_lock);
+  return n;
+}

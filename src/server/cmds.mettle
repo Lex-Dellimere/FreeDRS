@@ -1,0 +1,519 @@
+// freedrs/server/cmds: the commands of the wire protocol, one function per
+// command. Pure request -> reply text: no sockets and no actors, so the
+// session actor (session.mettle) owns all of that.
+//
+// A command appends its reply lines to a StrBuf (each ends in "\n"; the
+// session adds CMD_END) and may set s->action to ask the session for something
+// only it can do: start an upload, send file data, kick a session, close, or
+// stop the node. Role checks go through fd_can (auth/auth.mettle), which reads
+// the role table on every command, so setrole and createrole take effect at
+// once for sessions that are already connected.
+
+import "std/mem";
+import "std/conv";
+import "std/time";
+import "std/arena";
+import "std/strbuf";
+import "std/encoding";
+import "freedrs/status";
+import "freedrs/auth/roles";
+import "freedrs/auth/auth";
+import "freedrs/db/store";
+import "freedrs/db/models";
+import "freedrs/vfs/vfs";
+import "freedrs/server/state";
+
+export const FD_ACT_NONE: int32 = 0;
+export const FD_ACT_UPLOAD: int32 = 1;    // send READY, then collect base64 lines up to EOF
+export const FD_ACT_BULK: int32 = 2;      // after the reply text: s->bulk, then the download tail
+export const FD_ACT_KICK: int32 = 3;      // stop session s->act_arg (a client id)
+export const FD_ACT_QUIT: int32 = 4;      // close after the reply is flushed
+export const FD_ACT_SHUTDOWN: int32 = 5;  // stop the server shortly after the reply
+
+/// The bytes after the bulk data of a download.
+export const FD_DOWNLOAD_TAIL: string = "\nEND_FILE\nSUCCESS: File sent\n";
+
+const FD_LIST_MAX: int32 = 2000;
+
+/// Per-session protocol state. The session actor owns it (it lives in the
+/// actor state); commands read and update it.
+export struct FdSess {
+  client_id: int64;
+  user: FdUserInfo;
+  cwd: uint8[512];       // "/" or "/a/b"
+  cwd_len: int32;
+  action: int32;
+  act_arg: int64;
+  up_path: FdVPath;      // target of a pending upload
+  bulk: uint8*;          // FD_ACT_BULK: base64 text, in the command arena
+  bulk_len: int64;
+}
+
+export fn fd_sess_init(s: FdSess*) {
+  memset((rawptr)s, 0, (int64)sizeof(FdSess));
+  s->cwd[0] = (uint8)'/';
+  s->cwd_len = 1;
+}
+
+export fn fd_sess_cwd(s: FdSess*) -> string {
+  return str_from_bytes((cstring)&s->cwd[0], (int64)s->cwd_len);
+}
+
+// ---- small helpers ----
+
+export struct FdWords {
+  word: string;
+  rest: string;
+}
+
+/// Splits off the first whitespace separated word; rest is the remainder with
+/// its leading whitespace removed (so a password may contain spaces).
+export fn fd_next_word(s: string) -> FdWords {
+  var w: FdWords;
+  var n: int64 = (int64)s.length;
+  var i: int64 = 0;
+  while (i < n && is_space((char)s.chars[i])) { i = i + 1; }
+  var start: int64 = i;
+  while (i < n && !is_space((char)s.chars[i])) { i = i + 1; }
+  w.word = str_slice(s, start, i - start);
+  while (i < n && is_space((char)s.chars[i])) { i = i + 1; }
+  w.rest = str_slice(s, i, n - i);
+  return w;
+}
+
+/// Copies s lowercased into buf (cap bytes) and returns a view of it; "" when too long.
+export fn fd_lower(s: string, buf: uint8*, cap: int64) -> string {
+  if ((int64)s.length > cap) { return ""; }
+  var i: int64 = 0;
+  while (i < (int64)s.length) {
+    buf[i] = (uint8)to_lower((char)s.chars[i]);
+    i = i + 1;
+  }
+  return str_from_bytes((cstring)buf, (int64)s.length);
+}
+
+fn ln(b: StrBuf*, s: string) {
+  strbuf_append_string(b, s);
+  strbuf_append_byte(b, (uint8)10);
+}
+
+fn put(b: StrBuf*, s: string) {
+  strbuf_append_string(b, s);
+}
+
+fn err(b: StrBuf*, why: string) {
+  put(b, "ERROR: ");
+  ln(b, why);
+}
+
+fn err_rc(b: StrBuf*, rc: int32) {
+  err(b, fd_status_text(rc));
+}
+
+fn db_err2(b: StrBuf*, rc: int32) {
+  put(b, "ERROR: DB error: ");
+  ln(b, fd_status_text(rc));
+}
+
+fn db_err(b: StrBuf*, rc: int32) {
+  put(b, "ERROR: Database error: ");
+  ln(b, fd_status_text(rc));
+}
+
+fn is_admin(s: FdSess*) -> bool {
+  return fd_user_info_role(&s->user) == FD_ROLE_ADMIN;
+}
+
+// Resolves `input` against the session's directory; on failure writes the error reply.
+fn resolve(s: FdSess*, input: string, p: FdVPath*, b: StrBuf*) -> bool {
+  var rc: int32 = fd_vfs_resolve(fd_sess_cwd(s), input, p);
+  if (rc == FD_OK) { return true; }
+  if (rc == FD_E_TRAVERSAL) { err(b, "Path traversal not allowed"); }
+  else { err(b, "Invalid path"); }
+  return false;
+}
+
+fn entry_line(b: StrBuf*, e: FdEntryInfo*) {
+  put(b, "  ");
+  put(b, fd_entry_info_path(e));
+  if (e->kind == FD_KIND_DIR) { put(b, " [directory] "); } else { put(b, " [file] "); }
+  strbuf_append_int(b, e->size);
+  put(b, "B - ");
+  put(b, fd_entry_info_owner(e));
+  put(b, " (");
+  time_append_iso8601(b, time_utc(e->created * TIME_SECOND), 0);
+  put(b, ")\n");
+}
+
+// ---- file commands ----
+
+fn cmd_list(s: FdSess*, args: string, b: StrBuf*, a: Arena*) {
+  var p: FdVPath;
+  var rc: int32 = fd_vfs_resolve_or_cwd(fd_sess_cwd(s), args, &p);
+  if (rc != FD_OK) { err(b, "Invalid path"); return; }
+  var dir: string = fd_vpath_str(&p);
+  var pbuf: uint8[520];
+  var prefix: string = "";
+  if (dir.length > 0) {
+    memcpy((rawptr)&pbuf[0], (rawptr)dir.chars, (int64)dir.length);
+    pbuf[(int64)dir.length] = (uint8)'/';
+    prefix = str_from_bytes((cstring)&pbuf[0], (int64)dir.length + 1);
+  }
+  var ents: FdEntryInfo* = (FdEntryInfo*)arena_alloc(a, (int64)FD_LIST_MAX * (int64)sizeof(FdEntryInfo));
+  if (ents == 0) { err_rc(b, FD_E_NOMEM); return; }
+  var n: int32 = 0;
+  rc = fd_entry_list(&g_db, prefix, ents, FD_LIST_MAX, &n);
+  if (rc != FD_OK) { db_err(b, rc); return; }
+  if (n == 0) {
+    put(b, "No files found in ");
+    if (dir.length == 0) { ln(b, "root"); } else { ln(b, prefix); }
+    return;
+  }
+  put(b, "Files in ");
+  if (dir.length == 0) { put(b, "root"); } else { put(b, prefix); }
+  put(b, ":\n");
+  var i: int32 = 0;
+  while (i < n) { entry_line(b, &ents[i]); i = i + 1; }
+}
+
+fn cmd_myfiles(s: FdSess*, b: StrBuf*, a: Arena*) {
+  var ents: FdEntryInfo* = (FdEntryInfo*)arena_alloc(a, (int64)FD_LIST_MAX * (int64)sizeof(FdEntryInfo));
+  if (ents == 0) { err_rc(b, FD_E_NOMEM); return; }
+  var n: int32 = 0;
+  var rc: int32 = fd_entry_list_owner(&g_db, fd_user_info_name(&s->user), ents, FD_LIST_MAX, &n);
+  if (rc != FD_OK) { db_err(b, rc); return; }
+  if (n == 0) { ln(b, "You don't have any files."); return; }
+  ln(b, "Your files:");
+  var i: int32 = 0;
+  while (i < n) { entry_line(b, &ents[i]); i = i + 1; }
+}
+
+fn cmd_cd(s: FdSess*, args: string, b: StrBuf*) {
+  if (args.length == 0) { ln(b, "ERROR: Usage: cd <directory>"); return; }
+  var p: FdVPath;
+  if (!resolve(s, args, &p, b)) { return; }
+  var v: string = fd_vpath_str(&p);
+  s->cwd[0] = (uint8)'/';
+  memcpy((rawptr)&s->cwd[1], (rawptr)v.chars, (int64)v.length);
+  s->cwd_len = 1 + (int32)v.length;
+  put(b, "SUCCESS: Changed directory to: ");
+  ln(b, fd_sess_cwd(s));
+}
+
+fn cmd_mkdir(s: FdSess*, args: string, b: StrBuf*) {
+  if (args.length == 0) { ln(b, "ERROR: Usage: mkdir <directory-name>"); return; }
+  var p: FdVPath;
+  if (!resolve(s, args, &p, b)) { return; }
+  var v: string = fd_vpath_str(&p);
+  if (v.length == 0) { ln(b, "ERROR: Invalid path"); return; }
+  var rc: int32 = fd_vfs_mkdir(&g_vfs, v, fd_user_info_name(&s->user));
+  if (rc == FD_OK) { put(b, "SUCCESS: Directory created: "); ln(b, v); }
+  else if (rc == FD_E_EXISTS) { put(b, "ERROR: Already exists: "); ln(b, v); }
+  else { err_rc(b, rc); }
+}
+
+fn cmd_delete(s: FdSess*, args: string, b: StrBuf*) {
+  if (args.length == 0) { ln(b, "ERROR: Usage: delete <file-path>"); return; }
+  var p: FdVPath;
+  if (!resolve(s, args, &p, b)) { return; }
+  var v: string = fd_vpath_str(&p);
+  if (v.length == 0) { ln(b, "ERROR: Invalid path"); return; }
+  var rc: int32 = fd_vfs_delete(&g_vfs, v, fd_user_info_name(&s->user), is_admin(s));
+  if (rc == FD_OK) { ln(b, "SUCCESS: File deleted"); }
+  else if (rc == FD_E_NOT_FOUND) { ln(b, "ERROR: File not found"); }
+  else if (rc == FD_E_DENIED) { ln(b, "ERROR: Permission denied"); }
+  else if (rc == FD_E_NOT_EMPTY) { ln(b, "ERROR: Directory not empty"); }
+  else { err_rc(b, rc); }
+}
+
+fn cmd_upload(s: FdSess*, args: string, b: StrBuf*) {
+  if (args.length == 0) { ln(b, "ERROR: Usage: upload <local-file-path> [remote-path]"); return; }
+  var w: FdWords = fd_next_word(args);
+  var remote: string = w.rest;
+  if (remote.length == 0) {
+    // default: the basename of the local path
+    var i: int64 = (int64)w.word.length - 1;
+    while (i >= 0 && w.word.chars[i] != '/') { i = i - 1; }
+    remote = str_slice(w.word, i + 1, (int64)w.word.length - i - 1);
+  }
+  if (!resolve(s, remote, &s->up_path, b)) { return; }
+  if (fd_vpath_str(&s->up_path).length == 0) { ln(b, "ERROR: Invalid path"); return; }
+  s->action = FD_ACT_UPLOAD;
+}
+
+/// Finishes an upload: `b64` is every data line concatenated, `too_big` is set
+/// when the session had to drop data. Appends the reply (no READY line).
+export fn fd_cmd_upload_finish(s: FdSess*, b64: string, too_big: bool, b: StrBuf*, a: Arena*) {
+  if (too_big) { err_rc(b, FD_E_TOO_BIG); return; }
+  if (b64.length == 0) { ln(b, "ERROR: No file data received"); return; }
+  var need: int64 = 0;
+  match (base64_decoded_len(b64)) {
+    case Ok(n): { need = n; }
+    case Err(why): { err(b, why); return; }
+  }
+  if (need > FD_VFS_MAX_FILE) { err_rc(b, FD_E_TOO_BIG); return; }
+  var dst: cstring = (cstring)arena_alloc(a, need + 1);
+  if (dst == 0) { err_rc(b, FD_E_NOMEM); return; }
+  var data: string = "";
+  match (base64_decode(b64, dst, need + 1)) {
+    case Ok(d): { data = d; }
+    case Err(why): { err(b, why); return; }
+  }
+  var v: string = fd_vpath_str(&s->up_path);
+  var rc: int32 = fd_vfs_write(&g_vfs, v, (uint8*)data.chars, (int64)data.length,
+                               fd_user_info_name(&s->user));
+  if (rc != FD_OK) {
+    if (rc == FD_E_INVALID) { put(b, "ERROR: Cannot write "); ln(b, v); }
+    else { err_rc(b, rc); }
+    return;
+  }
+  put(b, "SUCCESS: File uploaded: ");
+  var e: FdEntryInfo;
+  if (fd_entry_get(&g_db, v, &e) == FD_OK) {
+    // the same line format as `list`, without its leading indent
+    var line: StrBuf* = strbuf_new(a, 256);
+    entry_line(line, &e);
+    var t: string = str_trim(strbuf_finish_string(line));
+    ln(b, t);
+  } else {
+    ln(b, v);
+  }
+}
+
+fn cmd_download(s: FdSess*, args: string, b: StrBuf*, a: Arena*) {
+  if (args.length == 0) { ln(b, "ERROR: Usage: download <remote-file-path>"); return; }
+  var p: FdVPath;
+  if (!resolve(s, args, &p, b)) { return; }
+  var v: string = fd_vpath_str(&p);
+  var size: int64 = 0;
+  var rc: int32 = FD_E_NOT_FOUND;
+  if (v.length > 0) { rc = fd_vfs_size(&g_vfs, v, &size); }
+  if (rc != FD_OK) { put(b, "ERROR: File not found: "); ln(b, v); return; }
+  var raw: uint8* = (uint8*)arena_alloc(a, size + 1);
+  if (raw == 0) { err_rc(b, FD_E_NOMEM); return; }
+  var n: int64 = 0;
+  rc = fd_vfs_read(&g_vfs, v, raw, size + 1, &n);
+  if (rc == FD_E_NOT_FOUND) { put(b, "ERROR: File not found: "); ln(b, v); return; }
+  if (rc != FD_OK) { err_rc(b, rc); return; }
+  var elen: int64 = 0;
+  match (base64_encoded_len(n)) {
+    case Ok(l): { elen = l; }
+    case Err(why): { err(b, why); return; }
+  }
+  var enc: cstring = (cstring)arena_alloc(a, elen + 1);
+  if (enc == 0) { err_rc(b, FD_E_NOMEM); return; }
+  match (base64_encode(str_from_bytes((cstring)raw, n), enc, elen + 1)) {
+    case Ok(out): { s->bulk = (uint8*)out.chars; s->bulk_len = (int64)out.length; }
+    case Err(why): { err(b, why); return; }
+  }
+  ln(b, "FILE_DATA:");
+  s->action = FD_ACT_BULK;
+}
+
+// ---- info commands ----
+
+fn cmd_help(s: FdSess*, b: StrBuf*) {
+  ln(b, "Available Commands:");
+  ln(b, "==================");
+  var r: FdRoleInfo;
+  var known: bool = false;
+  var commands: string = FD_GUEST_COMMANDS;
+  if (fd_role_commands(&g_db, fd_user_info_role(&s->user), &r, &known) == FD_OK && known) {
+    commands = fd_role_info_commands(&r);
+  }
+  if (str_trim(commands) == "*") {
+    ln(b, "All commands available (admin)");
+  } else {
+    var n: int64 = (int64)commands.length;
+    var start: int64 = 0;
+    var i: int64 = 0;
+    while (i <= n) {
+      if (i == n || commands.chars[i] == ',') {
+        var c: string = str_trim(str_slice(commands, start, i - start));
+        if (c.length > 0) { put(b, "  "); ln(b, c); }
+        start = i + 1;
+      }
+      i = i + 1;
+    }
+    ln(b, "");
+  }
+  ln(b, "Examples:");
+  ln(b, "  upload /home/user/file.txt");
+  ln(b, "  download file.txt");
+  ln(b, "  list .");
+  ln(b, "  delete oldfile.txt");
+}
+
+fn cmd_listclients(b: StrBuf*, a: Arena*) {
+  var cs: FdClient* = (FdClient*)arena_alloc(a, (int64)FD_MAX_CLIENTS * (int64)sizeof(FdClient));
+  if (cs == 0) { err_rc(b, FD_E_NOMEM); return; }
+  var n: int32 = fd_clients_snapshot(cs, FD_MAX_CLIENTS);
+  if (n == 0) { ln(b, "No clients connected"); return; }
+  ln(b, "Connected clients:");
+  var i: int32 = 0;
+  while (i < n) {
+    put(b, "  Client #");
+    strbuf_append_int(b, cs[i].id);
+    put(b, ": ");
+    put(b, fd_client_user(&cs[i]));
+    put(b, " [");
+    put(b, fd_client_role(&cs[i]));
+    put(b, "]\n");
+    i = i + 1;
+  }
+}
+
+fn cmd_clientinfo(args: string, b: StrBuf*) {
+  if (args.length == 0) { ln(b, "ERROR: Usage: clientinfo <client-id>"); return; }
+  var id: int64 = 0;
+  match (str_to_i64(str_trim(args))) {
+    case Ok(v): { id = v; }
+    case Err(why): { ln(b, "ERROR: Invalid client ID"); return; }
+  }
+  var c: FdClient;
+  if (!fd_clients_find(id, &c)) { ln(b, "ERROR: Client not found"); return; }
+  put(b, "Client #");
+  strbuf_append_int(b, c.id);
+  put(b, ": ");
+  put(b, fd_client_user(&c));
+  put(b, " (connected: ");
+  time_append_iso8601(b, time_utc(c.connected * TIME_SECOND), 0);
+  put(b, ")\n");
+}
+
+fn cmd_kick(s: FdSess*, args: string, b: StrBuf*) {
+  if (args.length == 0) { ln(b, "ERROR: Usage: kick <client-id>"); return; }
+  var id: int64 = 0;
+  match (str_to_i64(str_trim(args))) {
+    case Ok(v): { id = v; }
+    case Err(why): { ln(b, "ERROR: Invalid client ID"); return; }
+  }
+  var c: FdClient;
+  if (!fd_clients_find(id, &c)) { ln(b, "ERROR: Client not found"); return; }
+  s->action = FD_ACT_KICK;
+  s->act_arg = id;
+  put(b, "SUCCESS: Client #");
+  strbuf_append_int(b, id);
+  ln(b, " kicked.");
+}
+
+fn cmd_setrole(args: string, b: StrBuf*) {
+  var w: FdWords = fd_next_word(args);
+  if (w.word.length == 0 || w.rest.length == 0) { ln(b, "ERROR: Usage: setrole <username> <role>"); return; }
+  var rc: int32 = fd_user_set_role(&g_db, w.word, w.rest);
+  if (rc == FD_OK) { put(b, "SUCCESS: Role updated for "); ln(b, w.word); }
+  else if (rc == FD_E_NOT_FOUND) { ln(b, "ERROR: User not found"); }
+  else if (rc == FD_E_INVALID) { ln(b, "ERROR: Invalid role name"); }
+  else { db_err(b, rc); }
+}
+
+// ---- admin commands ----
+
+fn cmd_listroles(b: StrBuf*, a: Arena*) {
+  var rs: FdRoleInfo* = (FdRoleInfo*)arena_alloc(a, 256 * (int64)sizeof(FdRoleInfo));
+  if (rs == 0) { err_rc(b, FD_E_NOMEM); return; }
+  var n: int32 = 0;
+  var rc: int32 = fd_role_list(&g_db, rs, 256, &n);
+  if (rc != FD_OK) { db_err2(b, rc); return; }
+  var i: int32 = 0;
+  while (i < n) {
+    if (i > 0) { put(b, ", "); }
+    put(b, fd_role_info_name(&rs[i]));
+    i = i + 1;
+  }
+  put(b, "\n");
+}
+
+fn cmd_createrole(args: string, b: StrBuf*) {
+  var w: FdWords = fd_next_word(args);
+  if (w.word.length == 0 || w.rest.length == 0) {
+    ln(b, "ERROR: Usage: createrole <role> <comma-separated-commands>");
+    return;
+  }
+  var rc: int32 = fd_role_set(&g_db, w.word, w.rest);
+  if (rc == FD_OK) { ln(b, "SUCCESS: Role created/updated"); }
+  else if (rc == FD_E_INVALID) { ln(b, "ERROR: Invalid role name or command list"); }
+  else { db_err2(b, rc); }
+}
+
+fn cmd_deleterole(args: string, b: StrBuf*) {
+  if (args.length == 0) { ln(b, "ERROR: Usage: deleterole <role>"); return; }
+  var rc: int32 = fd_role_delete(&g_db, args);
+  if (rc == FD_OK) { ln(b, "SUCCESS: Role deleted"); }
+  else if (rc == FD_E_NOT_FOUND) { ln(b, "ERROR: Role not found"); }
+  else { db_err2(b, rc); }
+}
+
+fn cmd_deleteuser(args: string, b: StrBuf*) {
+  if (args.length == 0) { ln(b, "ERROR: Usage: deleteuser <username>"); return; }
+  var rc: int32 = fd_user_delete(&g_db, args);
+  if (rc == FD_OK) { ln(b, "SUCCESS: User deleted"); }
+  else if (rc == FD_E_NOT_FOUND) { ln(b, "ERROR: User not found"); }
+  else { db_err2(b, rc); }
+}
+
+fn cmd_renameuser(args: string, b: StrBuf*) {
+  var w: FdWords = fd_next_word(args);
+  if (w.word.length == 0 || w.rest.length == 0) {
+    ln(b, "ERROR: Usage: renameuser <old-username> <new-username>");
+    return;
+  }
+  var rc: int32 = fd_user_rename(&g_db, w.word, w.rest);
+  if (rc == FD_OK) { ln(b, "SUCCESS: User renamed"); }
+  else { ln(b, "ERROR: Failed to rename user (may already exist)"); }
+}
+
+fn cmd_resetsystem(b: StrBuf*) {
+  var rc: int32 = fd_system_reset(&g_db);
+  if (rc == FD_OK) { ln(b, "SUCCESS: System reset complete"); }
+  else { db_err2(b, rc); }
+}
+
+/// Runs one command line (already trimmed, non-empty) and appends the reply.
+/// `ping` is answered without a role check; everything else is checked with
+/// fd_can first. Sets s->action when the session must act.
+export fn fd_cmd_run(s: FdSess*, line: string, b: StrBuf*, a: Arena*) {
+  s->action = FD_ACT_NONE;
+  s->bulk = 0;
+  s->bulk_len = 0;
+  if (line.length == 0) { ln(b, "ERROR: Empty command"); return; }
+  var w: FdWords = fd_next_word(line);
+  var vbuf: uint8[32];
+  var verb: string = fd_lower(w.word, &vbuf[0], 32);
+  var args: string = w.rest;
+  if (verb == "ping") { ln(b, "PONG"); return; }
+  if (!fd_can(&g_db, &s->user, verb)) {
+    ln(b, "ERROR: Permission denied. Your role does not allow this command.");
+    return;
+  }
+  if (verb == "pwd") { put(b, "Current directory: "); ln(b, fd_sess_cwd(s)); }
+  else if (verb == "cd") { cmd_cd(s, args, b); }
+  else if (verb == "list") { cmd_list(s, args, b, a); }
+  else if (verb == "myfiles") { cmd_myfiles(s, b, a); }
+  else if (verb == "mkdir") { cmd_mkdir(s, args, b); }
+  else if (verb == "delete") { cmd_delete(s, args, b); }
+  else if (verb == "upload") { cmd_upload(s, args, b); }
+  else if (verb == "download") { cmd_download(s, args, b, a); }
+  else if (verb == "whoami") {
+    put(b, "You are client #");
+    strbuf_append_int(b, s->client_id);
+    put(b, " (");
+    put(b, fd_user_info_name(&s->user));
+    put(b, ")\n");
+  }
+  else if (verb == "help") { cmd_help(s, b); }
+  else if (verb == "refresh") { ln(b, "SUCCESS: File system metadata reloaded"); }
+  else if (verb == "listclients") { cmd_listclients(b, a); }
+  else if (verb == "clientinfo") { cmd_clientinfo(args, b); }
+  else if (verb == "kick") { cmd_kick(s, args, b); }
+  else if (verb == "setrole") { cmd_setrole(args, b); }
+  else if (verb == "listroles") { cmd_listroles(b, a); }
+  else if (verb == "createrole") { cmd_createrole(args, b); }
+  else if (verb == "deleterole") { cmd_deleterole(args, b); }
+  else if (verb == "deleteuser") { cmd_deleteuser(args, b); }
+  else if (verb == "renameuser") { cmd_renameuser(args, b); }
+  else if (verb == "resetsystem") { cmd_resetsystem(b); }
+  else if (verb == "shutdown") { ln(b, "SUCCESS: Server shutting down"); s->action = FD_ACT_SHUTDOWN; }
+  else if (verb == "quit" || verb == "exit") { ln(b, "Goodbye!"); s->action = FD_ACT_QUIT; }
+  else { ln(b, "ERROR: Unknown command. Type 'help' for available commands."); }
+}

@@ -1,0 +1,48 @@
+// mbuild.mettle: the FreeDRS project file (a distributed resource system: file
+// server, client and setup tool).
+//
+//   mbuild build        # builds the programs
+//   mbuild test         # @test files, then the test programs in tests/
+//   mbuild run freedrs_setup | freedrs_server | freedrs_client -- ARGS   (meodb service starts first)
+//
+// Dependencies: json comes from the mbuild registry. The others are local path
+// dependencies (same Projects/mettle tree).
+import "mbuild/api";
+
+fn project() {
+  mb_package("freedrs", "0.1.0");
+  mb_meta("description", "FreeDRS: distributed resource system: file server, client and setup tool");
+  mb_import_root("src");
+  mb_targets("linux");
+
+  // The setup tool: default roles and the admin user.
+  mb_bin("freedrs_setup", "src/setup/main.mettle");
+  // The server (alph: an acceptor actor and one session actor per client).
+  mb_bin("freedrs_server", "src/server/main.mettle");
+  // The command line client: auth prompt, REPL, upload/download, PING keepalive.
+  mb_bin("freedrs_client", "src/client/main.mettle");
+
+  // meodb server the FreeDRS server, setup tool and manager all connect to.
+  // `mbuild run` starts it first (build/<target>/<profile>/meodb) and stops it
+  // after. Data file: build/freedrs.meo. Address: 127.0.0.1:5490.
+  mb_service("meodb", "meodb --db build/freedrs.meo --listen 127.0.0.1:5490");
+  mb_service_port("meodb", 5490);
+
+  // alph catches failed checks (bounds, divide) only in -s builds: debug has it
+  // by default, release needs it set.
+  mb_profile("debug");
+  mb_set("stack-trace", "true");
+  mb_profile("release");
+  mb_set("stack-trace", "true");
+}
+
+fn deps() {
+  mb_dep("json", "v1.0.0");
+  mb_dep_path("meodb", "../meodb");
+  mb_dep_path("flux_orm", "../flux_orm");
+  mb_dep_path("flux_raize_auth", "../flux_orm/ext/raize_auth");
+  mb_dep_path("raize_auth", "../raize_auth");
+  mb_dep_path("crypto", "../cryptex");
+  mb_dep_path("alph", "../alph");
+  mb_dep_bin("meodb", "meodb");
+}

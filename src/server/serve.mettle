@@ -1,0 +1,147 @@
+// freedrs/server/serve: the listener, the acceptor and the node (shared by
+// main.mettle and the end-to-end test).
+//
+// alph actors:
+//   boss      top-level; traps exits. Starts the acceptor linked to itself, and
+//             if the acceptor ends (it listens for ever) stops the node.
+//   pool      alph worker pool (FD_POOL_SIZE threads), linked to the boss: runs
+//             the blocking work of every session (jobs.mettle).
+//   acceptor  owns the listening socket. For each connection it asks a dynamic
+//             supervisor (restart type TEMPORARY, one child per session) to
+//             start a session actor, then gives the accepted handle to it
+//             (alph_io_give) and monitors it, so the client registry is cleaned
+//             up even when a session crashes. The supervisor is linked to the
+//             acceptor and stops every session when the acceptor ends.
+//   session   one per client (session.mettle).
+// The pattern is alph's examples/echo.mettle (acceptor + dynamic supervisor +
+// connection actors with IO handles).
+
+import "std/mem";
+import "std/thread";
+import "alph/alph";
+import "freedrs/db/store";
+import "freedrs/server/state";
+import "freedrs/server/session";
+
+const REASON_LISTEN: int64 = ALPH_REASON_USER;
+const START_TIMEOUT_MS: int64 = 1000;
+
+var g_node: AlphNode;
+var g_port: int64 = 0;     // the bound port; -1 when listening failed; 0 not yet
+var g_listen_errno: int64 = 0;
+
+struct Acceptor {
+  port: int64;       // the port to listen on (0: any)
+  listener: int64;
+  sup: int64;
+  pool: int64;       // the worker pool the sessions use
+  asking: int64;     // ref of the start request in flight, or 0
+  waiting: int64;    // the accepted connection that request is for
+}
+
+// Takes one waiting connection, if any, and asks for a session actor to serve
+// it. With none waiting, arms the listener for the next.
+fn accept_next(ctx: AlphCtx*, a: Acceptor*) {
+  var h: int64 = alph_tcp_accept(ctx, a->listener);
+  if (h > 0) {
+    a->asking = fd_session_start(ctx, a->sup, a->pool, START_TIMEOUT_MS);
+    if (a->asking > 0) {
+      a->waiting = h;
+      return;
+    }
+    alph_io_close(ctx, h);   // the request was not sent
+  }
+  alph_io_arm(ctx, a->listener, ALPH_IO_IN);
+}
+
+fn acceptor(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var a: Acceptor* = (Acceptor*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    a->listener = alph_tcp_listen(ctx, alph_ip4(0, 0, 0, 0), a->port, 64, 0);
+    if (a->listener < 0) {
+      alph_atomic_store(&g_listen_errno, a->listener);
+      alph_atomic_store_sc(&g_port, -1);
+      return alph_stop(ctx, REASON_LISTEN);
+    }
+    var spec: AlphDynSpec;
+    fd_session_spec(&spec);
+    a->sup = alph_spawn_dyn(ctx, &spec);
+    alph_io_arm(ctx, a->listener, ALPH_IO_IN);
+    alph_atomic_store_sc(&g_port, alph_tcp_port(ctx, a->listener));
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_IO && m->ref == a->listener) {
+    if (a->asking == 0) { accept_next(ctx, a); }
+    return ALPH_CONTINUE;
+  }
+  if (a->asking != 0 && m->ref == a->asking) {
+    // The start request is answered: STARTED with the new pid, or DOWN or
+    // TIMEOUT. Hand the connection over, or close it if no actor took it.
+    var given: int64 = ALPH_GONE;
+    if (m->tag == ALPH_TAG_STARTED && m->arg != 0) {
+      given = alph_io_give(ctx, a->waiting, m->arg);
+      if (given == ALPH_SENT) { alph_monitor(ctx, m->arg); }
+    }
+    if (given != ALPH_SENT) { alph_io_close(ctx, a->waiting); }
+    a->asking = 0;
+    a->waiting = 0;
+    accept_next(ctx, a);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_DOWN) {
+    fd_clients_unregister_pid(m->from);   // a session ended (a normal end unregistered already)
+  }
+  return ALPH_CONTINUE;
+}
+
+struct Boss {
+  port: int64;
+}
+
+/// Worker threads for blocking jobs: one per database session in the pool, so
+/// a job never waits for a connection. Waiting jobs queue up to FD_MAX_CLIENTS.
+const POOL_QUEUE: int64 = 1024;
+
+fn boss(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var b: Boss* = (Boss*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_trap_exits(ctx, true);
+    var a: Acceptor;
+    memset((rawptr)&a, 0, (int64)sizeof(Acceptor));
+    a.port = b->port;
+    a.pool = alph_spawn_pool(ctx, (int64)FD_POOL_SIZE, POOL_QUEUE);   // linked: it ending stops the server
+    if (a.pool == 0) { return alph_stop(ctx, REASON_LISTEN); }
+    alph_spawn_value<Acceptor>(ctx, ALPH_LINK, &a, &acceptor);
+  } else if (m->tag == ALPH_TAG_EXIT) {
+    if (m->from == 0) { return alph_stop(ctx, m->arg); }   // the node is shutting down
+    if (m->arg != ALPH_NORMAL) { alph_shutdown(ctx, 1000, 1); }
+  }
+  return ALPH_CONTINUE;
+}
+
+/// Starts the alph node and the server on `port` (0 lets the OS pick) on all
+/// IPv4 addresses. Call once, from the main thread before other threads start
+/// (the node takes over the OS signals: SIGINT/SIGTERM shut it down in order).
+/// returns: true and *bound (the listening port); false and *msg
+export fn fd_server_start(port: int64, bound: int64*, msg: string*) -> bool {
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  if (!alph_node_start(&g_node, &cfg)) { *msg = "cannot start the alph node"; return false; }
+  var b: Boss;
+  b.port = port;
+  if (alph_node_spawn_value<Boss>(&g_node, 0, &b, &boss) == 0) { *msg = "cannot start the server actor"; return false; }
+  // The acceptor publishes the port (or -1) from its first handler call.
+  while (alph_atomic_load(&g_port) == 0) { thread_sleep_ms(2); }
+  if (alph_atomic_load(&g_port) < 0) {
+    *msg = "listen failed (errno {-alph_atomic_load(&g_listen_errno)})";
+    return false;
+  }
+  *bound = alph_atomic_load(&g_port);
+  return true;
+}
+
+/// Runs until the node stops (the `shutdown` command, a signal, or the acceptor
+/// failing). returns: the node's exit code.
+export fn fd_server_wait() -> int64 {
+  return alph_node_wait(&g_node);
+}

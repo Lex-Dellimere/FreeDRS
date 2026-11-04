@@ -1,0 +1,131 @@
+// freedrs/auth/auth: signup, login, guest and the role permission check.
+//
+// Passwords: Argon2id through raize_auth (which calls cryptex); the hash text
+// lives in the fd_users.password_hash column. A password field is always plain
+// text; a bcrypt hash passed as the password is just a wrong password.
+//
+// Lockout (raize_auth): 5 wrong passwords within 15 minutes lock that login
+// for 15 minutes; fd_auth_login then answers FD_E_LOCKED.
+//
+// The wire is not encrypted (no TLS in the stdlib): passwords cross it in clear.
+
+import "std/mem";
+import "std/conv";
+import "raize_auth/auth";
+import "std/time";
+import "freedrs/status";
+import "freedrs/auth/roles";
+import "freedrs/db/store";
+
+export struct FdAuth {
+  ra: RaAuth;
+  db: FdDb*;   // borrowed; must outlive the FdAuth
+}
+
+/// Current time in unix seconds (std/time), for raize_auth's lockout window.
+export fn fd_now_seconds() -> int64 {
+  return time_unix();
+}
+
+/// Sets up auth over an open database: initialises crypto and raize_auth
+/// (Argon2id INTERACTIVE; takes about one password hash of time).
+/// returns: FD_OK; FD_E_USAGE; FD_E_CRYPTO
+export fn fd_auth_init(a: FdAuth*, db: FdDb*) -> int32 {
+  if (a == 0 || db == 0 || !db->is_open) { return FD_E_USAGE; }
+  if (cr_init() != CR_OK) { return FD_E_CRYPTO; }
+  memset((rawptr)a, 0, (int64)sizeof(FdAuth));
+  a->db = db;
+  var cfg: RaConfig;
+  ra_config_defaults(&cfg);
+  if (ra_auth_init(&a->ra, &cfg, &db->ra) != RA_OK) { return FD_E_CRYPTO; }
+  return FD_OK;
+}
+
+// raize_auth status -> FD status.
+fn fd_ra(rc: int32) -> int32 {
+  if (rc == RA_OK) { return FD_OK; }
+  if (rc == RA_E_DENIED) { return FD_E_DENIED; }
+  if (rc == RA_E_LOCKED) { return FD_E_LOCKED; }
+  if (rc == RA_E_INVALID || rc == RA_E_USAGE) { return FD_E_INVALID; }
+  if (rc == RA_E_NOT_FOUND) { return FD_E_NOT_FOUND; }
+  if (rc == RA_E_CRYPTO) { return FD_E_CRYPTO; }
+  if (rc == RA_E_NOMEM) { return FD_E_NOMEM; }
+  return FD_E_DB;
+}
+
+/// Registers a new user with the `guest` role and the given password.
+/// returns: FD_OK and *out (the new user); FD_E_INVALID (bad name, or a
+///          password outside 8..1024 bytes); FD_E_EXISTS (name taken); FD_E_DB
+export fn fd_auth_signup(a: FdAuth*, username: string, password: string, out: FdUserInfo*) -> int32 {
+  if (a == 0 || out == 0) { return FD_E_USAGE; }
+  if (!fd_name_ok(username) || !ra_password_ok(password)) { return FD_E_INVALID; }
+  var id: int64 = 0;
+  var rc: int32 = fd_user_create(a->db, username, FD_ROLE_GUEST, &id);
+  if (rc != FD_OK) { return rc; }
+  rc = fd_ra(ra_set_password(&a->ra, id, password));
+  if (rc != FD_OK) {
+    fd_user_delete(a->db, username);   // no user without a password
+    return rc;
+  }
+  return fd_user_get(a->db, username, out);
+}
+
+/// Checks a password and returns the user.
+/// returns: FD_OK and *out; FD_E_DENIED (wrong password or unknown user: the
+///          same answer for both); FD_E_LOCKED; FD_E_INVALID; FD_E_DB
+export fn fd_auth_login(a: FdAuth*, username: string, password: string, out: FdUserInfo*) -> int32 {
+  if (a == 0 || out == 0) { return FD_E_USAGE; }
+  if (username.length == 0 || (int64)username.length > RA_LOGIN_MAX) { return FD_E_INVALID; }
+  var uid: int64 = 0;
+  var rc: int32 = fd_ra(ra_login(&a->ra, username, password, fd_now_seconds(), &uid));
+  if (rc != FD_OK) { return rc; }
+  rc = fd_user_get(a->db, username, out);
+  if (rc == FD_E_NOT_FOUND) { return FD_E_DENIED; }   // deleted since the check
+  return rc;
+}
+
+/// Makes a guest session user: name "guest_<0..9999>", id 0, role `guest`.
+/// Nothing is stored. returns: FD_OK; FD_E_CRYPTO when no random bytes.
+export fn fd_auth_guest(out: FdUserInfo*) -> int32 {
+  if (out == 0) { return FD_E_USAGE; }
+  var rnd: uint8[2];
+  if (cr_random_bytes(&rnd[0], 2) != CR_OK) { return FD_E_CRYPTO; }
+  var n: int64 = (((int64)rnd[0] << 8) | (int64)rnd[1]) % 10000;
+  var name: string = "guest_{n}";
+  memset((rawptr)out, 0, (int64)sizeof(FdUserInfo));
+  var len: int32 = (int32)name.length;
+  if (len > 64) { len = 64; }
+  memcpy((rawptr)&out->username[0], (rawptr)name.chars, (int64)len);
+  out->username_len = len;
+  memcpy((rawptr)&out->role[0], (rawptr)FD_ROLE_GUEST.chars, (int64)FD_ROLE_GUEST.length);
+  out->role_len = (int32)FD_ROLE_GUEST.length;
+  free((rawptr)name.chars);
+  return FD_OK;
+}
+
+/// Sets a new password for an existing user (setup tool, admin reset).
+/// returns: FD_OK; FD_E_NOT_FOUND; FD_E_INVALID (policy); FD_E_DB
+export fn fd_auth_set_password(a: FdAuth*, username: string, password: string) -> int32 {
+  if (a == 0) { return FD_E_USAGE; }
+  var u: FdUserInfo;
+  var rc: int32 = fd_user_get(a->db, username, &u);
+  if (rc != FD_OK) { return rc; }
+  rc = fd_ra(ra_set_password(&a->ra, u.id, password));
+  if (rc != FD_OK) { return rc; }
+  ra_lockout_clear(&a->ra, username);
+  return FD_OK;
+}
+
+/// Role permission check: may `user` run `verb`?
+///
+/// Looks the user's role up in the roles table and applies fd_role_allows ("*"
+/// = all). An unknown role gets the guest list. Fails closed: any database
+/// error answers false. The caller lowercases the verb. `ping` is exempt and
+/// is the protocol layer's business, not checked here.
+export fn fd_can(db: FdDb*, user: FdUserInfo*, verb: string) -> bool {
+  if (db == 0 || user == 0) { return false; }
+  var r: FdRoleInfo;
+  var known: bool = false;
+  if (fd_role_commands(db, fd_user_info_role(user), &r, &known) != FD_OK) { return false; }
+  return !fd_command_forbidden(known, fd_role_info_commands(&r), verb);
+}

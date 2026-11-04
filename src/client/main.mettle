@@ -1,0 +1,384 @@
+// freedrs_client: command line client.
+//
+//   freedrs_client [HOST[:PORT]] [--guest | --user NAME [--pass PASSWORD]]
+//
+// HOST defaults to 127.0.0.1, PORT to 5555. Without --user/--guest it asks
+// whether to log in, sign up or enter as guest. (The terminal echoes the
+// password: the stdlib cannot turn echo off.) Then a prompt: every line is sent
+// to the server and the reply printed up to CMD_END. Local commands:
+//   status                      connection state
+//   upload <local> [remote]     read the local file, send it base64 encoded
+//   download <remote> [local]   fetch a file and write it locally
+//   quit / exit                 leave
+// A PING goes out every 5 s while idle; 12 s without PONG ends the session.
+
+import "std/io";
+import "std/mem";
+import "std/conv";
+import "std/file";
+import "std/process";
+import "std/encoding";
+import "std/socket";
+import "freedrs/client/conn";
+
+const LOCAL_MAX: int64 = 16777216;   // the server's file size limit
+
+var g_line: uint8[2048];
+var g_user: string = "";
+var g_host: string = "127.0.0.1";
+var g_port: int32 = 5555;
+
+// One line from stdin without the newline. false at end of input.
+fn read_input(prompt: string, out: string*) -> bool {
+  print(prompt);
+  if (fgets((cstring)&g_line[0], 2048, get_stdin()) == 0) { return false; }
+  var n: int64 = 0;
+  while (n < 2048 && g_line[n] != (uint8)0) { n = n + 1; }
+  while (n > 0 && (g_line[n - 1] == (uint8)10 || g_line[n - 1] == (uint8)13)) { n = n - 1; }
+  *out = str_from_bytes((cstring)&g_line[0], n);
+  return true;
+}
+
+// The first word and the rest of a line.
+struct Words {
+  word: string;
+  rest: string;
+}
+
+fn split_word(s: string) -> Words {
+  var w: Words;
+  var n: int64 = (int64)s.length;
+  var i: int64 = 0;
+  while (i < n && is_space((char)s.chars[i])) { i = i + 1; }
+  var start: int64 = i;
+  while (i < n && !is_space((char)s.chars[i])) { i = i + 1; }
+  w.word = str_slice(s, start, i - start);
+  while (i < n && is_space((char)s.chars[i])) { i = i + 1; }
+  w.rest = str_slice(s, i, n - i);
+  return w;
+}
+
+fn base_name(path: string) -> string {
+  var i: int64 = (int64)path.length - 1;
+  while (i >= 0 && path.chars[i] != '/') { i = i - 1; }
+  return str_slice(path, i + 1, (int64)path.length - i - 1);
+}
+
+// Next line from the server; false (with a message) when the connection closed.
+fn next(out: string*) -> bool {
+  if (fd_conn_next_line(out)) { return true; }
+  println_err("freedrs: connection closed by the server");
+  return false;
+}
+
+// ---- local files ----
+
+// Reads a whole local file into a malloc'd buffer. false (message printed) on failure.
+fn read_local(path: string, out: uint8**, n: int64*) -> bool {
+  var fd: int64 = file_open(path, FILE_READ);
+  if (fd < 0) { println_err("ERROR: cannot open local file {path}"); return false; }
+  var size: int64 = file_size(fd);
+  if (size < 0 || size > LOCAL_MAX) {
+    file_close(fd);
+    println_err("ERROR: local file {path} is too large (limit {LOCAL_MAX} bytes)");
+    return false;
+  }
+  var buf: uint8* = (uint8*)malloc(size + 1);
+  if (buf == 0) { file_close(fd); println_err("ERROR: out of memory"); return false; }
+  var got: int64 = 0;
+  while (got < size) {
+    var r: int64 = file_read_at(fd, buf + got, size - got, got);
+    if (r <= 0) { break; }
+    got = got + r;
+  }
+  file_close(fd);
+  if (got != size) { free((rawptr)buf); println_err("ERROR: cannot read {path}"); return false; }
+  *out = buf;
+  *n = size;
+  return true;
+}
+
+fn write_local(path: string, data: uint8*, n: int64) -> bool {
+  var fd: int64 = file_open(path, FILE_WRITE | FILE_CREATE | FILE_TRUNCATE);
+  if (fd < 0) { return false; }
+  var off: int64 = 0;
+  while (off < n) {
+    var w: int64 = file_write_at(fd, data + off, n - off, off);
+    if (w <= 0) { file_close(fd); return false; }
+    off = off + w;
+  }
+  file_close(fd);
+  return true;
+}
+
+// ---- replies ----
+
+// Prints reply lines up to CMD_END. A FILE_DATA block is not printed; its data
+// is decoded and, when `save_as` is not empty, written there. false: connection lost.
+fn print_reply(save_as: string) -> bool {
+  var line: string;
+  var want_data: bool = false;
+  while (true) {
+    if (!next(&line)) { return false; }
+    if (line == "CMD_END") { fd_conn_free_line(line); return true; }
+    if (want_data) {
+      want_data = false;
+      var cap: int64 = (int64)line.length;
+      var buf: uint8* = (uint8*)malloc(cap + 1);
+      if (buf == 0) {
+        println_err("ERROR: out of memory");
+      } else {
+        match (base64_decode(line, (cstring)buf, cap + 1)) {
+          case Ok(d): {
+            if (save_as.length == 0) { println("(received {d.length} bytes)"); }
+            else if (write_local(save_as, (uint8*)d.chars, (int64)d.length)) {
+              println("Saved {d.length} bytes to {save_as}");
+            } else {
+              println_err("ERROR: cannot write {save_as}");
+            }
+          }
+          case Err(why): { println_err("ERROR: bad file data from the server: {why}"); }
+        }
+        free((rawptr)buf);
+      }
+    } else if (line == "FILE_DATA:") {
+      want_data = true;
+    } else if (line != "END_FILE") {
+      println(line);
+    }
+    fd_conn_free_line(line);
+  }
+  return true;
+}
+
+fn do_upload(args: string, full: string) -> bool {
+  var w: Words = split_word(args);
+  if (w.word.length == 0) { println("ERROR: Usage: upload <local-file-path> [remote-path]"); return true; }
+  var data: uint8* = 0;
+  var n: int64 = 0;
+  if (!read_local(w.word, &data, &n)) { return true; }
+  var elen: int64 = 0;
+  match (base64_encoded_len(n)) {
+    case Ok(l): { elen = l; }
+    case Err(why): { free((rawptr)data); println_err("ERROR: {why}"); return true; }
+  }
+  var enc: uint8* = (uint8*)malloc(elen + 8);
+  if (enc == 0) { free((rawptr)data); println_err("ERROR: out of memory"); return true; }
+  var text: string = "";
+  match (base64_encode(str_from_bytes((cstring)data, n), (cstring)enc, elen + 1)) {
+    case Ok(t): { text = t; }
+    case Err(why): { free((rawptr)data); free((rawptr)enc); println_err("ERROR: {why}"); return true; }
+  }
+  free((rawptr)data);
+  fd_conn_busy(true);
+  var ok: bool = fd_conn_send_line(full);
+  var first: string;
+  if (ok) { ok = next(&first); }
+  if (ok) {
+    if (str_starts_with(first, "READY:") != 0) {
+      fd_conn_free_line(first);
+      // the body: one base64 line, then EOF
+      enc[(int64)text.length] = (uint8)10;
+      ok = fd_conn_send_bytes(enc, (int64)text.length + 1) && fd_conn_send_line("EOF");
+      if (ok) { ok = print_reply(""); }
+    } else {
+      // refused (usage, permission): the line is the reply, CMD_END follows
+      if (first != "CMD_END") { println(first); ok = print_reply(""); }
+      fd_conn_free_line(first);
+    }
+  }
+  free((rawptr)enc);
+  fd_conn_busy(false);
+  return ok;
+}
+
+fn do_download(args: string, full: string) -> bool {
+  var w: Words = split_word(args);
+  if (w.word.length == 0) { println("ERROR: Usage: download <remote-file-path> [local-path]"); return true; }
+  var local: string = w.rest;
+  if (local.length == 0) { local = base_name(w.word); }
+  fd_conn_busy(true);
+  // the server takes everything after the verb as the remote path, so send only that
+  var ok: bool = fd_conn_send_line("download {w.word}");
+  if (ok) { ok = print_reply(local); }
+  fd_conn_busy(false);
+  return ok;
+}
+
+// ---- login ----
+
+// Sends the login/signup/guest line and reads the server's answer.
+// 1 = logged in, 0 = refused (message printed), -1 = connection lost,
+// 2 = signed up (the server closes; reconnect and log in).
+fn authenticate(cmd: string) -> int32 {
+  if (!fd_conn_send_line(cmd)) { return -1; }
+  var line: string;
+  if (!next(&line)) { return -1; }
+  var res: int32 = 0;
+  if (str_starts_with(line, "SUCCESS: User registered") != 0) { res = 2; }
+  else if (str_starts_with(line, "SUCCESS") != 0) { res = 1; }
+  println(line);
+  fd_conn_free_line(line);
+  if (res == 1) {
+    if (!next(&line)) { return -1; }   // "Type 'help' ..."
+    println(line);
+    fd_conn_free_line(line);
+  }
+  return res;
+}
+
+fn connect_and_greet() -> bool {
+  var msg: string = "";
+  if (!fd_conn_open(g_host, g_port, true, &msg)) {
+    println_err("freedrs: cannot connect to {g_host}:{g_port}: {msg}");
+    return false;
+  }
+  var line: string;
+  var i: int32 = 0;
+  while (i < 2) {
+    if (!next(&line)) { return false; }
+    println(line);
+    fd_conn_free_line(line);
+    i = i + 1;
+  }
+  return true;
+}
+
+// A heap copy of s (g_line is reused by the next read).
+fn dup(s: string) -> string {
+  var p: uint8* = (uint8*)malloc((int64)s.length + 1);
+  if (s.length > 0) { memcpy((rawptr)p, (rawptr)s.chars, (int64)s.length); }
+  return str_from_bytes((cstring)p, (int64)s.length);
+}
+
+// Asks for a user name and password. false at end of input.
+fn ask_credentials(creds: Creds*) -> bool {
+  var tmp: string;
+  if (!read_input("Username: ", &tmp)) { return false; }
+  creds->user = dup(tmp);
+  if (!read_input("Password: ", &tmp)) { return false; }
+  creds->pass = dup(tmp);
+  return true;
+}
+
+struct Creds {
+  user: string;
+  pass: string;
+}
+
+// Interactive: ask how to authenticate (or use the command line). false: give up.
+fn prompt_auth(first: Creds*, guest_first: bool) -> bool {
+  var creds: Creds = *first;
+  var guest: bool = guest_first;
+  var tries: int32 = 0;
+  while (tries < 5) {
+    tries = tries + 1;
+    if (!connect_and_greet()) { return false; }
+    // The server answers PING only after login, so no heartbeat while the
+    // user is typing credentials.
+    fd_conn_busy(true);
+    var mode: string = "l";
+    if (guest) {
+      mode = "g";
+    } else if (creds.user.length > 0 && creds.pass.length == 0) {
+      var pw: string;
+      if (!read_input("Password for {creds.user}: ", &pw)) { return false; }
+      creds.pass = dup(pw);
+    } else if (creds.user.length == 0) {
+      var ans: string;
+      if (!read_input("[l]ogin, [s]ignup or [g]uest? ", &ans)) { return false; }
+      mode = dup(ans);
+      if (!(mode == "g" || mode == "guest")) {
+        if (!ask_credentials(&creds)) { return false; }
+      }
+    }
+    var cmd: string = "guest";
+    if (mode == "s" || mode == "signup") { cmd = "signup {creds.user} {creds.pass}"; }
+    else if (mode == "l" || mode == "login") { cmd = "login {creds.user} {creds.pass}"; }
+    var r: int32 = authenticate(cmd);
+    if (r == 1) {
+      g_user = "guest";
+      if (creds.user.length > 0 && mode != "g" && mode != "guest") { g_user = creds.user; }
+      fd_conn_busy(false);
+      return true;
+    }
+    if (r < 0) { return false; }
+    fd_conn_close();
+    guest = false;
+    if (r == 2) {
+      // signed up: the server closed the connection; connect again and log in
+      println("Signed up. Logging in...");
+    } else {
+      creds.user = "";   // refused: ask again
+      creds.pass = "";
+    }
+  }
+  return false;
+}
+
+// ---- the REPL ----
+
+fn repl() -> int32 {
+  var line: string;
+  while (true) {
+    if (!read_input("{g_user}@{g_host}> ", &line)) { break; }
+    var t: string = str_trim(line);
+    if (t.length == 0) { continue; }
+    var w: Words = split_word(t);
+    var verb: string = "";
+    var vb: uint8[16];
+    if (w.word.length < 16) {
+      var i: int64 = 0;
+      while (i < (int64)w.word.length) { vb[i] = (uint8)to_lower((char)w.word.chars[i]); i = i + 1; }
+      verb = str_from_bytes((cstring)&vb[0], (int64)w.word.length);
+    }
+    var ok: bool = true;
+    if (verb == "status") {
+      println("Connected to {g_host}:{g_port} as {g_user}");
+    } else if (verb == "upload") {
+      ok = do_upload(w.rest, t);
+    } else if (verb == "download") {
+      ok = do_download(w.rest, t);
+    } else {
+      fd_conn_busy(true);
+      ok = fd_conn_send_line(t);
+      if (ok) { ok = print_reply(""); }
+      fd_conn_busy(false);
+      if (verb == "quit" || verb == "exit") { break; }
+    }
+    if (!ok) { return 1; }
+  }
+  fd_conn_send_line("quit");
+  fd_conn_close();
+  return 0;
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  var user: string = "";
+  var pass: string = "";
+  var guest: bool = false;
+  var hostport: string = "";
+  var i: int32 = 1;
+  while (i < argc) {
+    var arg: string = str_from_cstr(argv[i]);
+    if (arg == "--guest") { guest = true; i = i + 1; }
+    else if (arg == "--user" && i + 1 < argc) { user = str_from_cstr(argv[i + 1]); i = i + 2; }
+    else if (arg == "--pass" && i + 1 < argc) { pass = str_from_cstr(argv[i + 1]); i = i + 2; }
+    else if (str_starts_with(arg, "-") == 0 && hostport.length == 0) { hostport = arg; i = i + 1; }
+    else {
+      println_err("usage: freedrs_client [HOST[:PORT]] [--guest | --user NAME [--pass PASSWORD]]");
+      return 2;
+    }
+  }
+  if (hostport.length > 0) {
+    match (net_split_host_port(hostport, 5555)) {
+      case Ok(hp): { g_host = hp.host; g_port = hp.port; }
+      case Err(why): { println_err("freedrs_client: bad address: {why}"); return 2; }
+    }
+  }
+  var creds: Creds;
+  creds.user = user;
+  creds.pass = pass;
+  if (!prompt_auth(&creds, guest)) { return 1; }
+  return repl();
+}

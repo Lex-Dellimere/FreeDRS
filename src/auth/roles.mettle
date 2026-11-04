@@ -1,0 +1,113 @@
+// freedrs/auth/roles: role permission logic, pure and without a database.
+//
+// A role maps to a comma-separated list of command verbs; the list "*" allows
+// every verb. The list is split on ',', each entry trimmed, empty entries
+// ignored, verbs compared exactly (callers lowercase the verb first). A role
+// that does not exist falls back to the guest list.
+
+import "std/conv";
+import "std/core";
+
+export const FD_ROLE_ADMIN: string = "admin";
+export const FD_ROLE_GUEST: string = "guest";
+/// Verbs of the admin role: everything.
+export const FD_ADMIN_COMMANDS: string = "*";
+/// Verbs of the guest role (also the fallback for an unknown role).
+export const FD_GUEST_COMMANDS: string = "list,pwd,cd,help,whoami,quit,exit";
+
+/// Longest user or role name, in bytes.
+export const FD_NAME_MAX: int32 = 64;
+/// Longest comma-separated verb list stored for a role, in bytes.
+export const FD_COMMANDS_MAX: int32 = 1024;
+
+/// True when `commands` (a role's verb list) allows `verb`.
+///
+/// in:      commands  "*" or "list,pwd,cd"; verb  e.g. "list" (lowercase)
+/// returns: true when the list is "*" (after trimming) or contains the verb
+export fn fd_role_allows(commands: string, verb: string) -> bool {
+  var all: string = str_trim(commands);
+  if (all == "*") { return true; }
+  if (verb.length == 0) { return false; }
+  var start: int64 = 0;
+  var n: int64 = (int64)commands.length;
+  var i: int64 = 0;
+  while (i <= n) {
+    if (i == n || commands.chars[i] == ',') {
+      var entry: string = str_trim(str_slice(commands, start, i - start));
+      if (entry.length > 0 && entry == verb) { return true; }
+      start = i + 1;
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+/// True when a role may not run `verb`. `commands` is the role's verb list, or
+/// "" with `known` false when the role does not exist (guest list applies).
+export fn fd_command_forbidden(known: bool, commands: string, verb: string) -> bool {
+  if (!known) { return !fd_role_allows(FD_GUEST_COMMANDS, verb); }
+  return !fd_role_allows(commands, verb);
+}
+
+/// True when s is a usable user or role name: 1..FD_NAME_MAX bytes, printable
+/// ASCII with no space (the wire protocol splits lines on whitespace) and no
+/// comma (role verb lists are comma separated).
+export fn fd_name_ok(s: string) -> bool {
+  var n: int64 = (int64)s.length;
+  if (n < 1 || n > (int64)FD_NAME_MAX) { return false; }
+  var i: int64 = 0;
+  while (i < n) {
+    var c: int32 = (int32)s.chars[i];
+    if (c <= 32 || c >= 127 || c == 44) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+@test fn t_role_admin_allows_all() -> int32 {
+  if (!fd_role_allows("*", "upload")) { return 1; }
+  if (!fd_role_allows("  * ", "shutdown")) { return 2; }
+  return 0;
+}
+
+@test fn t_role_guest_list() -> int32 {
+  if (!fd_role_allows(FD_GUEST_COMMANDS, "list")) { return 1; }
+  if (!fd_role_allows(FD_GUEST_COMMANDS, "exit")) { return 2; }
+  if (fd_role_allows(FD_GUEST_COMMANDS, "upload")) { return 3; }
+  if (fd_role_allows(FD_GUEST_COMMANDS, "delete")) { return 4; }
+  if (fd_role_allows(FD_GUEST_COMMANDS, "lis")) { return 5; }
+  if (fd_role_allows(FD_GUEST_COMMANDS, "")) { return 6; }
+  return 0;
+}
+
+@test fn t_role_spaces_and_empty_entries() -> int32 {
+  if (!fd_role_allows(" list , upload ,, pwd", "upload")) { return 1; }
+  if (!fd_role_allows(" list , upload ,, pwd", "pwd")) { return 2; }
+  if (fd_role_allows(" list , upload ,, pwd", "")) { return 3; }
+  if (fd_role_allows("", "list")) { return 4; }
+  if (fd_role_allows(",,", "list")) { return 5; }
+  return 0;
+}
+
+@test fn t_role_case_sensitive() -> int32 {
+  if (fd_role_allows("list", "LIST")) { return 1; }
+  return 0;
+}
+
+@test fn t_command_forbidden() -> int32 {
+  if (fd_command_forbidden(true, "*", "kick")) { return 1; }
+  if (!fd_command_forbidden(true, "list", "kick")) { return 2; }
+  // unknown role: guest set
+  if (fd_command_forbidden(false, "", "pwd")) { return 3; }
+  if (!fd_command_forbidden(false, "", "upload")) { return 4; }
+  return 0;
+}
+
+@test fn t_name_ok() -> int32 {
+  if (!fd_name_ok("alice")) { return 1; }
+  if (fd_name_ok("")) { return 2; }
+  if (fd_name_ok("a b")) { return 3; }
+  if (fd_name_ok("a,b")) { return 4; }
+  if (fd_name_ok("tab\there")) { return 5; }
+  return 0;
+}

@@ -1,0 +1,475 @@
+// freedrs/server/session: one alph actor per client connection.
+//
+// The acceptor (serve.mettle) gives each accepted socket to a new session actor
+// (ALPH_TAG_IO_GIVEN); from then on the session owns the IO handle, reads it
+// when armed (ALPH_TAG_IO), and writes through an output queue (AlphOutq), so no
+// call blocks on the socket. A session that sees a read or write fail, or the
+// peer close, ends; the runtime closes the handle when the actor exits.
+//
+// States:
+//   AUTH    greeting; `login`, `signup` or `guest`; no CMD_END.
+//   CMD     one line in, reply lines and CMD_END out (cmds.mettle).
+//   UPLOAD  after `upload`: base64 lines until a line `EOF`, then the reply.
+//
+// `kick` sends the target session actor a TAG_KICK message (state.mettle keeps
+// the pid); it ends itself. `shutdown` asks the node to stop in order.
+//
+// Nothing in a handler blocks. Logins, signups, every command (meodb, Argon2id,
+// VFS file IO) and the end of an upload run as jobs on alph's worker pool
+// (jobs.mettle, alph_offload): the session sends a copy of what the job needs,
+// stops running lines while the job is out (st->job), and applies the answer
+// (ALPH_TAG_DONE: the new FdSess and the reply text) when it arrives. Collecting
+// upload lines and queueing output stay in the actor.
+
+import "std/mem";
+import "std/conv";
+import "std/arena";
+import "std/strbuf";
+import "alph/alph";
+import "freedrs/status";
+import "freedrs/auth/auth";
+import "freedrs/db/store";
+import "freedrs/server/state";
+import "freedrs/server/cmds";
+import "freedrs/server/jobs";
+
+const MODE_AUTH: int32 = 0;
+const MODE_CMD: int32 = 1;
+const MODE_UPLOAD: int32 = 2;
+
+const RBUF_START: int64 = 65536;
+/// Longest line accepted (a base64 upload is one line), in bytes.
+const LINE_MAX: int64 = 25165824;
+/// Base64 text accepted for one upload; more is dropped and reported.
+const UPLOAD_MAX: int64 = 22369700;
+
+/// How long a job may take before the session answers with an error.
+const JOB_TIMEOUT_MS: int64 = 120000;
+
+const GREETING: string = "=== Distributed File System ===\nAvailable: login <user> <pass> OR signup <user> <pass> OR guest\n";
+const HELP_PROMPT: string = "Type 'help' for available commands\n";
+
+struct FdSession {
+  sess: FdSess;
+  h: int64;        // the IO handle of the client socket
+  ctx: AlphCtx*;   // valid only inside the current handler call
+  out: AlphOutq;
+  pool: int64;     // the worker pool's pid
+  job: int64;      // ref of the job in flight, or 0
+  job_kind: int32;
+  mode: int32;
+  closing: bool;   // leave once the output is written
+  broken: bool;    // the output queue overflowed
+  shutting: bool;  // the `shutdown` command ran
+  registered: bool;
+  rbuf: uint8*;
+  rlen: int64;
+  rcap: int64;
+  rstart: int64;
+  rscan: int64;
+  up: uint8*;
+  up_len: int64;
+  up_cap: int64;
+  up_over: bool;
+}
+
+// ---- output ----
+
+const OUT_LIMIT: int64 = 33554432;   // a 16 MiB file is 22.4 MB of base64
+/// Message to a session: end it (kick).
+export const TAG_KICK: int64 = ALPH_TAG_USER;
+
+fn out_put(st: FdSession*, p: rawptr, n: int64) {
+  if (n <= 0 || st->broken) { return; }
+  if (alph_outq_push(st->ctx, &st->out, p, n) != ALPH_SENT) { st->broken = true; }
+}
+
+fn out_str(st: FdSession*, s: string) {
+  out_put(st, (rawptr)s.chars, (int64)s.length);
+}
+
+fn out_buf(st: FdSession*, b: StrBuf*) {
+  out_put(st, (rawptr)b->data, b->len);
+}
+
+// ---- input ----
+
+// Next complete line (without \n or \r) into *out, valid until the buffer is
+// next refilled. false: no complete line yet.
+fn take_line(st: FdSession*, out: string*) -> bool {
+  var i: int64 = st->rscan;
+  while (i < st->rlen) {
+    if (st->rbuf[i] == (uint8)10) {
+      var end: int64 = i;
+      if (end > st->rstart && st->rbuf[end - 1] == (uint8)13) { end = end - 1; }
+      *out = str_from_bytes((cstring)(st->rbuf + st->rstart), end - st->rstart);
+      st->rstart = i + 1;
+      st->rscan = i + 1;
+      return true;
+    }
+    i = i + 1;
+  }
+  st->rscan = st->rlen;
+  return false;
+}
+
+// Makes room to read into: moves the unread bytes to the front and grows the
+// buffer. false: the line is longer than LINE_MAX.
+fn make_room(st: FdSession*) -> bool {
+  if (st->rstart > 0) {
+    var rest: int64 = st->rlen - st->rstart;
+    if (rest > 0) { memmove((rawptr)st->rbuf, (rawptr)(st->rbuf + st->rstart), rest); }
+    st->rlen = rest;
+    st->rscan = rest;
+    st->rstart = 0;
+  }
+  if (st->rcap - st->rlen < 4096) {
+    var cap: int64 = st->rcap * 2;
+    if (cap > LINE_MAX + RBUF_START) { cap = LINE_MAX + RBUF_START; }
+    if (cap <= st->rcap) { return false; }
+    var p: rawptr = alph_realloc(st->ctx, (rawptr)st->rbuf, cap);
+    if (p == 0) { return false; }
+    st->rbuf = (uint8*)p;
+    st->rcap = cap;
+  }
+  return true;
+}
+
+// ---- login ----
+
+fn is_word(s: string, lower: string) -> bool {
+  var buf: uint8[16];
+  return fd_lower(s, &buf[0], 16) == lower;
+}
+
+fn complete_login(st: FdSession*, welcome: string) {
+  var id: int64 = fd_clients_register(st->ctx->self, fd_user_info_name(&st->sess.user),
+                                      fd_user_info_role(&st->sess.user));
+  if (id == 0) {
+    out_str(st, "ERROR: Server full\n");
+    st->closing = true;
+    return;
+  }
+  st->sess.client_id = id;
+  st->registered = true;
+  st->mode = MODE_CMD;
+  out_str(st, welcome);
+  out_str(st, HELP_PROMPT);
+}
+
+fn db_error(st: FdSession*, rc: int32) {
+  out_str(st, "ERROR: Database error: ");
+  out_str(st, fd_status_text(rc));
+  out_str(st, "\n");
+}
+
+fn busy_error(st: FdSession*, kind: int32) {
+  if (kind == JOB_LOGIN || kind == JOB_SIGNUP) {
+    out_str(st, "ERROR: Server busy, try again\n");
+  } else {
+    out_str(st, "ERROR: Server busy, try again\nCMD_END\n");
+  }
+}
+
+// Sends a job (header + text) to the worker pool. The session then waits for
+// the answer (st->job); no more lines are run until it comes.
+// `text` may be 0 for a header-only job. For JOB_UPLOAD the header is built in
+// place in the upload buffer (see handle_upload_line), passed as `ji`.
+fn submit(st: FdSession*, ji: FdJobIn*, text: rawptr, text_len: int64, whole: bool) {
+  var hdr: int64 = (int64)sizeof(FdJobIn);
+  var block: rawptr = (rawptr)ji;
+  var total: int64 = hdr + text_len;
+  if (!whole) {
+    block = alph_scratch(st->ctx, total);
+    if (block == 0) { busy_error(st, ji->kind); return; }
+    memcpy(block, (rawptr)ji, hdr);
+    if (text_len > 0) { memcpy((rawptr)((uint8*)block + hdr), text, text_len); }
+  }
+  var ref: int64 = alph_offload(st->ctx, st->pool, block, total, JOB_TIMEOUT_MS, &fd_job_run);
+  if (ref <= 0) { busy_error(st, ji->kind); return; }   // pool full or no memory
+  st->job = ref;
+  st->job_kind = ji->kind;
+}
+
+fn handle_auth(st: FdSession*, line: string) {
+  var t: string = str_trim(line);
+  if (t.length == 0) { return; }
+  if (is_word(t, "guest")) {
+    if (fd_auth_guest(&st->sess.user) != FD_OK) { db_error(st, FD_E_CRYPTO); return; }
+    complete_login(st, "SUCCESS: Logged in as GUEST\n");
+    return;
+  }
+  var w: FdWords = fd_next_word(t);
+  var u: FdWords = fd_next_word(w.rest);
+  if (w.word.length == 0 || u.word.length == 0 || u.rest.length == 0) {
+    out_str(st, "ERROR: Invalid format. Use: login <user> <pass>, signup <user> <pass> OR guest\n");
+    return;
+  }
+  var kind: int32 = 0;
+  if (is_word(w.word, "login")) { kind = JOB_LOGIN; }
+  else if (is_word(w.word, "signup")) { kind = JOB_SIGNUP; }
+  else { out_str(st, "ERROR: Unknown command. Use login or signup.\n"); return; }
+  // The hash and the database work happen on the pool: text = user, then password.
+  var un: int64 = (int64)u.word.length;
+  var pn: int64 = (int64)u.rest.length;
+  var buf: rawptr = alph_scratch(st->ctx, un + pn);
+  if (buf == 0) { busy_error(st, kind); return; }
+  memcpy(buf, (rawptr)u.word.chars, un);
+  memcpy((rawptr)((uint8*)buf + un), (rawptr)u.rest.chars, pn);
+  var ji: FdJobIn;
+  memset((rawptr)&ji, 0, (int64)sizeof(FdJobIn));
+  ji.kind = kind;
+  ji.user_len = un;
+  ji.len = un + pn;
+  submit(st, &ji, buf, un + pn, false);
+}
+
+// The answer to a login or signup job.
+fn auth_done(st: FdSession*, o: FdJobOut*) {
+  var rc: int32 = o->rc;
+  if (st->job_kind == JOB_LOGIN) {
+    if (rc == FD_OK) {
+      memcpy((rawptr)&st->sess.user, (rawptr)&o->user, (int64)sizeof(FdUserInfo));
+      var a: Arena* = arena_init(4096);
+      var sb: StrBuf* = strbuf_new(a, 128);
+      strbuf_append_string(sb, "SUCCESS: Welcome back, ");
+      strbuf_append_string(sb, fd_user_info_name(&st->sess.user));
+      strbuf_append_string(sb, " [");
+      strbuf_append_string(sb, fd_user_info_role(&st->sess.user));
+      strbuf_append_string(sb, "]\n");
+      complete_login(st, strbuf_finish_string(sb));
+      arena_free(a);
+    } else if (rc == FD_E_DENIED || rc == FD_E_INVALID || rc == FD_E_NOT_FOUND) {
+      out_str(st, "ERROR: Invalid username or password\n");
+    } else if (rc == FD_E_LOCKED) {
+      out_str(st, "ERROR: Too many failed logins. Try again later\n");
+    } else {
+      db_error(st, rc);
+    }
+  } else {
+    if (rc == FD_OK) {
+      out_str(st, "SUCCESS: User registered. Please login.\n");
+      st->closing = true;
+    } else if (rc == FD_E_EXISTS) {
+      out_str(st, "ERROR: Username already exists\n");
+    } else if (rc == FD_E_INVALID) {
+      out_str(st, "ERROR: Invalid username or password (password needs 8 or more characters)\n");
+    } else {
+      db_error(st, rc);
+    }
+  }
+}
+
+// ---- commands ----
+
+// Starts one command on the pool.
+fn run_command(st: FdSession*, line: string) {
+  var ji: FdJobIn;
+  memset((rawptr)&ji, 0, (int64)sizeof(FdJobIn));
+  ji.kind = JOB_CMD;
+  ji.len = (int64)line.length;
+  memcpy((rawptr)&ji.sess, (rawptr)&st->sess, (int64)sizeof(FdSess));
+  submit(st, &ji, (rawptr)line.chars, (int64)line.length, false);
+}
+
+// Starts the end of an upload on the pool. The collected data already sits
+// behind a header-sized gap in st->up, so it is sent from there without
+// another copy; the buffer is freed once the job is on its way.
+fn finish_upload(st: FdSession*) {
+  if (st->up == 0) {   // an empty upload: the header alone
+    st->up = (uint8*)alph_alloc(st->ctx, up_hdr());
+    if (st->up == 0) { busy_error(st, JOB_UPLOAD); return; }
+    st->up_cap = up_hdr();
+  }
+  var ji: FdJobIn* = (FdJobIn*)st->up;
+  memset((rawptr)ji, 0, up_hdr());
+  ji->kind = JOB_UPLOAD;
+  ji->over = st->up_over;
+  ji->len = st->up_len;
+  memcpy((rawptr)&ji->sess, (rawptr)&st->sess, (int64)sizeof(FdSess));
+  submit(st, ji, 0, st->up_len, true);
+  alph_free(st->ctx, (rawptr)st->up);
+  st->up = 0;
+  st->up_cap = 0;
+  st->up_len = 0;
+}
+
+// The answer to a command or upload job: the reply, then what the command asked for.
+fn command_done(st: FdSession*, o: FdJobOut*, size: int64) {
+  var hdr: int64 = (int64)sizeof(FdJobOut);
+  if (size < hdr + o->reply_len + o->bulk_len) { busy_error(st, JOB_CMD); return; }
+  memcpy((rawptr)&st->sess, (rawptr)&o->sess, (int64)sizeof(FdSess));
+  var reply: uint8* = (uint8*)o + hdr;
+  out_put(st, (rawptr)reply, o->reply_len);
+  var act: int32 = st->sess.action;
+  if (act == FD_ACT_UPLOAD) {
+    out_str(st, "READY: Send file data (base64 encoded). END with 'EOF' on a new line.\n");
+    st->mode = MODE_UPLOAD;
+    st->up_len = 0;
+    st->up_over = false;
+    return;
+  }
+  if (act == FD_ACT_BULK) {
+    out_put(st, (rawptr)(reply + o->reply_len), o->bulk_len);
+    out_str(st, FD_DOWNLOAD_TAIL);
+  }
+  out_str(st, "CMD_END\n");
+  if (act == FD_ACT_QUIT) { st->closing = true; }
+  if (act == FD_ACT_KICK) {
+    var c: FdClient;
+    if (st->sess.act_arg == st->sess.client_id) {
+      st->closing = true;
+    } else if (fd_clients_find(st->sess.act_arg, &c)) {
+      alph_send(st->ctx, c.pid, TAG_KICK, 0);   // it ends itself
+    }
+  }
+  if (act == FD_ACT_SHUTDOWN) { st->shutting = true; }   // acted on once the reply is written
+}
+
+// Bytes before the upload data in st->up: room for the job header.
+fn up_hdr() -> int64 { return (int64)sizeof(FdJobIn); }
+
+fn handle_upload_line(st: FdSession*, line: string) {
+  if (line == "EOF") {
+    st->mode = MODE_CMD;
+    finish_upload(st);
+    return;
+  }
+  if (st->up_over) { return; }
+  var n: int64 = (int64)line.length;
+  if (st->up_len + n > UPLOAD_MAX) { st->up_over = true; return; }
+  var need: int64 = up_hdr() + st->up_len + n;
+  if (need > st->up_cap) {
+    var cap: int64 = st->up_cap * 2;
+    if (cap < need) { cap = need; }
+    if (cap < 65536) { cap = 65536; }
+    var p: rawptr = alph_realloc(st->ctx, (rawptr)st->up, cap);   // ptr 0 allocates
+    if (p == 0) { st->up_over = true; return; }
+    st->up = (uint8*)p;
+    st->up_cap = cap;
+  }
+  memcpy((rawptr)(st->up + up_hdr() + st->up_len), (rawptr)line.chars, n);
+  st->up_len = st->up_len + n;
+}
+
+fn handle_line(st: FdSession*, line: string) {
+  if (st->mode == MODE_AUTH) { handle_auth(st, line); return; }
+  if (st->mode == MODE_UPLOAD) { handle_upload_line(st, line); return; }
+  run_command(st, str_trim(line));
+}
+
+// ---- the actor ----
+
+// Ends the session: unregisters it; the runtime frees the heap and closes the handle.
+fn end_session(ctx: AlphCtx*, st: FdSession*) -> int64 {
+  if (st->registered) { fd_clients_unregister(st->sess.client_id); st->registered = false; }
+  return alph_stop(ctx, ALPH_NORMAL);
+}
+
+// Writes what the socket takes; ends the session when it is done or broken,
+// otherwise arms the handle again: for input unless a job is out (the answer
+// comes as a message, and the next line waits for it), for output while some is waiting.
+fn settle(ctx: AlphCtx*, st: FdSession*) -> int64 {
+  if (st->broken) { return end_session(ctx, st); }
+  var left: int64 = alph_outq_flush(ctx, &st->out, st->h);
+  if (left < 0) { return end_session(ctx, st); }
+  if (st->shutting) {
+    st->shutting = false;
+    alph_shutdown(ctx, 500, 0);   // the reply was queued first; flushed above
+  }
+  if (st->closing && left == 0 && st->job == 0) { return end_session(ctx, st); }
+  var events: int64 = 0;
+  if (!st->closing && st->job == 0) { events = ALPH_IO_IN; }
+  if (left > 0) { events = events | ALPH_IO_OUT; }
+  if (events != 0) { alph_io_arm(ctx, st->h, events); }
+  return ALPH_CONTINUE;
+}
+
+// Runs every complete line in the buffer, until a job is started.
+fn run_lines(st: FdSession*) {
+  var line: string = "";
+  while (!st->closing && !st->broken && st->job == 0 && take_line(st, &line)) { handle_line(st, line); }
+}
+
+// Runs buffered lines, then reads what has arrived (bounded, so the handler
+// returns promptly) and runs those, until a job is out, nothing is left or the
+// session is ending.
+fn read_input(st: FdSession*) {
+  var reads: int32 = 0;
+  while (true) {
+    run_lines(st);
+    if (st->closing || st->broken || st->job != 0 || reads >= 16) { return; }
+    if (!make_room(st)) {
+      out_str(st, "ERROR: Line too long\n");
+      st->closing = true;
+      return;
+    }
+    var n: int64 = alph_io_read(st->ctx, st->h, (rawptr)(st->rbuf + st->rlen), st->rcap - st->rlen);
+    if (n == ALPH_IO_AGAIN) { return; }
+    if (n <= 0) { st->closing = true; return; }   // closed or failed: leave once the output is out
+    st->rlen = st->rlen + n;
+    reads = reads + 1;
+  }
+}
+
+// The pool's answer for the job in flight (DONE, or FAILED, DOWN, TIMEOUT).
+fn job_answer(st: FdSession*, m: AlphMsg*) {
+  var kind: int32 = st->job_kind;
+  st->job = 0;
+  var size: int64 = 0;
+  var data: rawptr = alph_msg_bytes(m, &size);
+  if (m->tag != ALPH_TAG_DONE || m->arg != 0 || size < (int64)sizeof(FdJobOut)) {
+    busy_error(st, kind);
+    return;
+  }
+  if (kind == JOB_LOGIN || kind == JOB_SIGNUP) { auth_done(st, (FdJobOut*)data); }
+  else { command_done(st, (FdJobOut*)data, size); }
+}
+
+/// The session actor. Its state is a zeroed FdSession with the pool's pid; the
+/// client socket's handle arrives in ALPH_TAG_IO_GIVEN.
+export fn fd_session_actor(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var st: FdSession* = (FdSession*)ctx->state;
+  st->ctx = ctx;
+  if (m->tag == ALPH_TAG_IO_GIVEN) {
+    st->h = m->ref;
+    fd_sess_init(&st->sess);
+    st->mode = MODE_AUTH;
+    alph_outq_init(&st->out, OUT_LIMIT);
+    st->rbuf = (uint8*)alph_alloc(ctx, RBUF_START);
+    if (st->rbuf == 0) { return end_session(ctx, st); }
+    st->rcap = RBUF_START;
+    alph_tcp_nodelay(ctx, st->h, true);
+    out_str(st, GREETING);
+    return settle(ctx, st);
+  }
+  if (st->h == 0) { return ALPH_CONTINUE; }   // INIT: the handle has not arrived yet
+  if (m->tag == TAG_KICK) { return end_session(ctx, st); }
+  if (st->job != 0 && m->ref == st->job) {
+    job_answer(st, m);
+    read_input(st);   // lines that arrived while the job ran
+    return settle(ctx, st);
+  }
+  if (m->tag == ALPH_TAG_IO && m->ref == st->h) {
+    if ((m->arg & ALPH_IO_IN) != 0 || (m->arg & (ALPH_IO_ERR | ALPH_IO_HUP)) != 0) { read_input(st); }
+    return settle(ctx, st);
+  }
+  return ALPH_CONTINUE;
+}
+
+/// Asks the dynamic supervisor `sup` to start a session actor that uses the
+/// worker pool `pool` (zeroed state otherwise).
+/// returns: the request ref (> 0; ALPH_TAG_STARTED later carries the pid), or
+///          ALPH_FULL / ALPH_NOMEM when it was not sent
+export fn fd_session_start(ctx: AlphCtx*, sup: int64, pool: int64, timeout_ms: int64) -> int64 {
+  var st: FdSession;
+  memset((rawptr)&st, 0, (int64)sizeof(FdSession));
+  st.pool = pool;
+  return alph_dyn_start_value<FdSession>(ctx, sup, &st, timeout_ms);
+}
+
+/// A dynamic supervisor spec for sessions: they are not restarted when they end.
+export fn fd_session_spec(spec: AlphDynSpec*) {
+  alph_dyn_init(spec, &fd_session_actor);
+  spec->restart = ALPH_TEMPORARY;
+}

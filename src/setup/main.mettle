@@ -1,0 +1,78 @@
+// freedrs_setup: first-run tool. Connects to the meodb server,
+// creates the tables, the default roles and the admin user.
+//
+//   freedrs_setup [--meodb IP:PORT] [--admin-user NAME]
+//
+// It asks for the admin password on stdin (the terminal echoes it: the stdlib
+// cannot turn echo off); a pipe works too: `printf 'secret-pass\n' | freedrs_setup`.
+// The meodb address defaults to 127.0.0.1:5490 (FD_DEFAULT_MEODB).
+//
+// TODO: ask for the port and root directory and save server_config.json once a
+// JSON writer is available. For now config comes from the defaults.
+
+import "std/io";
+import "std/mem";
+import "std/conv";
+import "freedrs/status";
+import "freedrs/config/config";
+import "freedrs/auth/auth";
+import "freedrs/db/store";
+import "freedrs/setup/setup";
+
+fn cstr_view(p: cstring) -> string {
+  return str_from_cstr(p);
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  var cfg: FdConfig;
+  fd_config_defaults(&cfg);
+  var admin_override: string = "";
+  var i: int32 = 1;
+  while (i < argc) {
+    var arg: string = cstr_view(argv[i]);
+    if (arg == "--meodb" && i + 1 < argc) {
+      if (fd_config_set_meodb(&cfg, cstr_view(argv[i + 1])) != FD_OK) {
+        println_err("freedrs_setup: bad --meodb address");
+        return 2;
+      }
+      i = i + 2;
+    } else if (arg == "--admin-user" && i + 1 < argc) {
+      admin_override = cstr_view(argv[i + 1]);
+      i = i + 2;
+    } else {
+      println_err("usage: freedrs_setup [--meodb IP:PORT] [--admin-user NAME]");
+      return 2;
+    }
+  }
+  var admin_user: string = fd_config_admin_user(&cfg);
+  if (admin_override.length > 0) { admin_user = admin_override; }
+
+  var db: FdDb;
+  var rc: int32 = fd_db_open(&db, fd_config_meodb(&cfg), "");
+  if (rc != FD_OK) {
+    println_err("freedrs_setup: cannot reach meodb at {fd_config_meodb(&cfg)}: {fd_status_text(rc)}");
+    println_err("  start it first: mbuild run (starts the meodb service), or");
+    println_err("  meodb --db build/freedrs.meo --listen 127.0.0.1:5490");
+    return 1;
+  }
+  var auth: FdAuth;
+  rc = fd_auth_init(&auth, &db);
+  if (rc != FD_OK) {
+    println_err("freedrs_setup: auth init failed: {fd_status_text(rc)}");
+    fd_db_close(&db);
+    return 1;
+  }
+
+  print("Admin user [{admin_user}] password (8+ characters): ");
+  var buf: uint8[1100];
+  var pw: string = read_line_stdin((cstring)&buf[0], 1100);
+  rc = fd_setup_run(&auth, admin_user, pw);
+  memset((rawptr)&buf[0], 0, 1100);
+  fd_db_close(&db);
+  if (rc != FD_OK) {
+    println_err("freedrs_setup: failed: {fd_status_text(rc)}");
+    return 1;
+  }
+  println("Setup complete: roles admin and guest, admin user '{admin_user}'.");
+  return 0;
+}

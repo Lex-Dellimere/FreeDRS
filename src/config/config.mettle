@@ -1,0 +1,186 @@
+// freedrs/config/config: server configuration.
+//
+// The document is a server_config.json file:
+//   { "port": 5555, "resourcesPath": "dfs_root", "meodb": "127.0.0.1:5490",
+//     "adminUser": "admin" }
+// Unknown keys (such as "db" or "adminPass") are skipped; the admin password
+// is never read from or kept in the config.
+//
+// Parsing uses the json pull reader. All strings are copied into fixed buffers
+// inside FdConfig, so a config is a plain value with no owner.
+
+import "std/mem";
+import "std/conv";
+import "std/file";
+import "json/json";
+import "freedrs/status";
+
+export const FD_CFG_STR_CAP: int32 = 256;
+export const FD_DEFAULT_PORT: int64 = 5555;
+export const FD_DEFAULT_ROOT: string = "dfs_root";
+export const FD_DEFAULT_MEODB: string = "127.0.0.1:5490";
+export const FD_DEFAULT_ADMIN: string = "admin";
+
+export struct FdConfig {
+  port: int64;
+  root: uint8[256];
+  root_len: int32;
+  meodb: uint8[256];
+  meodb_len: int32;
+  admin_user: uint8[256];
+  admin_user_len: int32;
+}
+
+// Copies s into buf (cap FD_CFG_STR_CAP), updating *len. False when too long.
+fn fd_cfg_put(buf: uint8*, len: int32*, s: string) -> bool {
+  if ((int64)s.length >= (int64)FD_CFG_STR_CAP) { return false; }
+  if (s.length > 0) { memcpy((rawptr)buf, (rawptr)s.chars, (int64)s.length); }
+  *len = (int32)s.length;
+  return true;
+}
+
+/// Fills a config with the defaults (port 5555, root "dfs_root", meodb
+/// 127.0.0.1:5490, admin user "admin").
+export fn fd_config_defaults(c: FdConfig*) {
+  memset((rawptr)c, 0, (int64)sizeof(FdConfig));
+  c->port = FD_DEFAULT_PORT;
+  fd_cfg_put(&c->root[0], &c->root_len, FD_DEFAULT_ROOT);
+  fd_cfg_put(&c->meodb[0], &c->meodb_len, FD_DEFAULT_MEODB);
+  fd_cfg_put(&c->admin_user[0], &c->admin_user_len, FD_DEFAULT_ADMIN);
+}
+
+/// The root directory for stored files (a view into c).
+export fn fd_config_root(c: FdConfig*) -> string {
+  return str_from_bytes((cstring)&c->root[0], (int64)c->root_len);
+}
+
+/// The meodb server address, "ip:port" (a view into c).
+export fn fd_config_meodb(c: FdConfig*) -> string {
+  return str_from_bytes((cstring)&c->meodb[0], (int64)c->meodb_len);
+}
+
+/// The admin user name for the setup tool (a view into c).
+export fn fd_config_admin_user(c: FdConfig*) -> string {
+  return str_from_bytes((cstring)&c->admin_user[0], (int64)c->admin_user_len);
+}
+
+/// Sets the meodb address ("ip:port"). FD_E_INVALID when empty or too long.
+export fn fd_config_set_meodb(c: FdConfig*, addr: string) -> int32 {
+  if (c == 0 || addr.length == 0) { return FD_E_INVALID; }
+  if (!fd_cfg_put(&c->meodb[0], &c->meodb_len, addr)) { return FD_E_INVALID; }
+  return FD_OK;
+}
+
+/// Sets the TCP port. FD_E_INVALID outside 1..65535 (0 is allowed: the OS picks).
+export fn fd_config_set_port(c: FdConfig*, port: int64) -> int32 {
+  if (c == 0 || port < 0 || port > 65535) { return FD_E_INVALID; }
+  c->port = port;
+  return FD_OK;
+}
+
+/// Sets the VFS root directory. FD_E_INVALID when empty or too long.
+export fn fd_config_set_root(c: FdConfig*, path: string) -> int32 {
+  if (c == 0 || path.length == 0) { return FD_E_INVALID; }
+  if (!fd_cfg_put(&c->root[0], &c->root_len, path)) { return FD_E_INVALID; }
+  return FD_OK;
+}
+
+// Reads the current string token into buf; false when it does not fit.
+fn fd_cfg_read_string(r: JsonReader*, buf: uint8*, len: int32*) -> bool {
+  var n: int64 = json_string_length(r);
+  if (n <= 0 || n >= (int64)FD_CFG_STR_CAP) { return false; }
+  var got: int64 = json_string_copy(r, buf, (int64)FD_CFG_STR_CAP);
+  if (got != n) { return false; }
+  *len = (int32)got;
+  return true;
+}
+
+/// Parses a server_config.json document onto c. Keys that are absent keep the
+/// value c already has, so call fd_config_defaults first.
+///
+/// returns: FD_OK; FD_E_INVALID for malformed JSON, a non-object document, a
+///          port outside 1..65535, or a string that is empty or too long
+export fn fd_config_parse(c: FdConfig*, document: string) -> int32 {
+  if (c == 0) { return FD_E_USAGE; }
+  var r: JsonReader;
+  json_begin(&r, document);
+  if (json_next(&r) != JSON_OBJECT_START) { return FD_E_INVALID; }
+  var port: int64 = c->port;
+  var root: uint8[256];
+  var root_len: int32 = c->root_len;
+  memcpy((rawptr)&root[0], (rawptr)&c->root[0], 256);
+  var meodb: uint8[256];
+  var meodb_len: int32 = c->meodb_len;
+  memcpy((rawptr)&meodb[0], (rawptr)&c->meodb[0], 256);
+  var admin: uint8[256];
+  var admin_len: int32 = c->admin_user_len;
+  memcpy((rawptr)&admin[0], (rawptr)&c->admin_user[0], 256);
+
+  var ev: int32 = json_next(&r);
+  while (ev == JSON_KEY) {
+    var key_port: bool = json_text_is(&r, "port");
+    var key_root: bool = json_text_is(&r, "resourcesPath");
+    var key_meodb: bool = json_text_is(&r, "meodb");
+    var key_admin: bool = json_text_is(&r, "adminUser");
+    ev = json_next(&r);
+    if (ev == JSON_ERROR) { return FD_E_INVALID; }
+    if (key_port) {
+      if (ev != JSON_NUMBER || !json_read_int64(&r, &port)) { return FD_E_INVALID; }
+      if (port < 1 || port > 65535) { return FD_E_INVALID; }
+    } else if (key_root) {
+      if (ev != JSON_STRING || !fd_cfg_read_string(&r, &root[0], &root_len)) { return FD_E_INVALID; }
+    } else if (key_meodb) {
+      if (ev != JSON_STRING || !fd_cfg_read_string(&r, &meodb[0], &meodb_len)) { return FD_E_INVALID; }
+    } else if (key_admin) {
+      if (ev != JSON_STRING || !fd_cfg_read_string(&r, &admin[0], &admin_len)) { return FD_E_INVALID; }
+    } else {
+      if (json_skip(&r) == JSON_ERROR) { return FD_E_INVALID; }
+    }
+    ev = json_next(&r);
+  }
+  if (ev != JSON_OBJECT_END) { return FD_E_INVALID; }
+  if (json_next(&r) != JSON_END) { return FD_E_INVALID; }
+
+  c->port = port;
+  memcpy((rawptr)&c->root[0], (rawptr)&root[0], 256);
+  c->root_len = root_len;
+  memcpy((rawptr)&c->meodb[0], (rawptr)&meodb[0], 256);
+  c->meodb_len = meodb_len;
+  memcpy((rawptr)&c->admin_user[0], (rawptr)&admin[0], 256);
+  c->admin_user_len = admin_len;
+  return FD_OK;
+}
+
+/// Largest config file read, in bytes.
+export const FD_CONFIG_FILE_MAX: int64 = 65536;
+
+/// Loads server_config.json from `path` with std/file and parses it onto c
+/// (call fd_config_defaults first).
+///
+/// returns: FD_OK; FD_E_NOT_FOUND (no such file); FD_E_DENIED (cannot open);
+///          FD_E_INVALID (too large, short read, or bad document)
+export fn fd_config_load(c: FdConfig*, path: string) -> int32 {
+  if (c == 0 || path.length == 0) { return FD_E_USAGE; }
+  var fd: int64 = file_open(path, FILE_READ);
+  if (fd < 0) {
+    if (fd == -(int64)FILE_ENOENT) { return FD_E_NOT_FOUND; }
+    return FD_E_DENIED;
+  }
+  var size: int64 = file_size(fd);
+  if (size < 0 || size > FD_CONFIG_FILE_MAX) { file_close(fd); return FD_E_INVALID; }
+  var buf: uint8* = (uint8*)malloc(size + 1);
+  if (buf == 0) { file_close(fd); return FD_E_NOMEM; }
+  var got: int64 = 0;
+  while (got < size) {
+    var r: int64 = file_read_at(fd, buf + got, size - got, got);
+    if (r <= 0) { break; }
+    got = got + r;
+  }
+  file_close(fd);
+  var rc: int32 = FD_E_INVALID;
+  if (got == size) { rc = fd_config_parse(c, str_from_bytes((cstring)buf, size)); }
+  free((rawptr)buf);
+  return rc;
+}
+
+// TODO: fd_config_save, once there is a JSON writer.

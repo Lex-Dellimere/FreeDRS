@@ -1,0 +1,126 @@
+// tests/auth_test: signup, login, guest, lockout, the setup tool's core and the
+// role permission check can(user, verb), against a real meodb server (embedded,
+// see harness.mettle). A test program (Argon2id is too slow for @test):
+// `mbuild test auth`.
+
+import "std/io";
+import "std/mem";
+import "std/conv";
+import "harness";
+import "freedrs/status";
+import "freedrs/auth/roles";
+import "freedrs/auth/auth";
+import "freedrs/db/store";
+import "freedrs/setup/setup";
+
+fn run(addr: string) -> int32 {
+  var db: FdDb;
+  if (fd_db_open(&db, addr, "") != FD_OK) {
+    th_check("open", false);
+    return 1;
+  }
+  th_check("seed roles", fd_roles_seed(&db) == FD_OK);
+  var a: FdAuth;
+  th_check("auth init", fd_auth_init(&a, &db) == FD_OK);
+
+  // ---- signup ----
+  var u: FdUserInfo;
+  th_check("signup", fd_auth_signup(&a, "alice", "correct horse", &u) == FD_OK);
+  th_check("signup role is guest", fd_user_info_name(&u) == "alice" && fd_user_info_role(&u) == "guest"
+           && u.id > 0);
+  th_check("signup duplicate", fd_auth_signup(&a, "alice", "another pass", &u) == FD_E_EXISTS);
+  th_check("signup short password", fd_auth_signup(&a, "shorty", "short", &u) == FD_E_INVALID);
+  th_check("short password leaves no user", fd_user_get(&db, "shorty", &u) == FD_E_NOT_FOUND);
+  th_check("signup bad name", fd_auth_signup(&a, "bad name", "correct horse", &u) == FD_E_INVALID);
+
+  // ---- login ----
+  th_check("login", fd_auth_login(&a, "alice", "correct horse", &u) == FD_OK);
+  th_check("login user", fd_user_info_name(&u) == "alice" && fd_user_info_role(&u) == "guest");
+  th_check("wrong password", fd_auth_login(&a, "alice", "wrong horse!", &u) == FD_E_DENIED);
+  th_check("unknown user", fd_auth_login(&a, "nobody", "correct horse", &u) == FD_E_DENIED);
+  th_check("empty user", fd_auth_login(&a, "", "correct horse", &u) == FD_E_INVALID);
+  // A bcrypt hash passed as the password is just a wrong password.
+  th_check("no pass-the-hash", fd_auth_login(&a, "alice", "$2a$10$abcdefghijklmnopqrstuvwxyz0123456789", &u)
+           == FD_E_DENIED);
+  th_check("signup with spaces", fd_auth_signup(&a, "spacey", "pass with spaces in it", &u) == FD_OK);
+  th_check("login with spaces", fd_auth_login(&a, "spacey", "pass with spaces in it", &u) == FD_OK);
+
+  // ---- guest ----
+  var g: FdUserInfo;
+  th_check("guest", fd_auth_guest(&g) == FD_OK);
+  th_check("guest name", str_starts_with(fd_user_info_name(&g), "guest_") != 0);
+  th_check("guest role", fd_user_info_role(&g) == "guest" && g.id == 0);
+  th_check("guest not stored", fd_user_get(&db, fd_user_info_name(&g), &u) == FD_E_NOT_FOUND);
+
+  // ---- can(user, verb) ----
+  th_check("guest can list", fd_can(&db, &g, "list"));
+  th_check("guest can exit", fd_can(&db, &g, "exit"));
+  th_check("guest cannot upload", !fd_can(&db, &g, "upload"));
+  th_check("guest cannot kick", !fd_can(&db, &g, "kick"));
+  var alice: FdUserInfo;
+  fd_user_get(&db, "alice", &alice);
+  th_check("signed-up user is guest: list", fd_can(&db, &alice, "list"));
+  th_check("signed-up user is guest: delete", !fd_can(&db, &alice, "delete"));
+  th_check("custom role", fd_role_set(&db, "editor", "list, upload ,download") == FD_OK);
+  th_check("promote to editor", fd_user_set_role(&db, "alice", "editor") == FD_OK);
+  fd_user_get(&db, "alice", &alice);
+  th_check("editor can upload", fd_can(&db, &alice, "upload"));
+  th_check("editor can download", fd_can(&db, &alice, "download"));
+  th_check("editor cannot delete", !fd_can(&db, &alice, "delete"));
+  th_check("editor cannot pwd", !fd_can(&db, &alice, "pwd"));
+  th_check("role deleted: guest list applies", fd_role_delete(&db, "editor") == FD_OK);
+  th_check("deleted role cannot upload", !fd_can(&db, &alice, "upload"));
+  th_check("deleted role can pwd", fd_can(&db, &alice, "pwd"));
+  th_check("admin role", fd_user_set_role(&db, "alice", "admin") == FD_OK);
+  fd_user_get(&db, "alice", &alice);
+  th_check("admin can anything", fd_can(&db, &alice, "shutdown") && fd_can(&db, &alice, "resetsystem"));
+  th_check("null user", !fd_can(&db, (FdUserInfo*)0, "list"));
+
+  // ---- lockout: 5 wrong passwords lock the login, even for the right one ----
+  th_check("signup locky", fd_auth_signup(&a, "locky", "right password", &u) == FD_OK);
+  var k: int32 = 0;
+  while (k < 5) {
+    th_check("locky wrong {k}", fd_auth_login(&a, "locky", "wrong password", &u) == FD_E_DENIED);
+    k = k + 1;
+  }
+  th_check("locked", fd_auth_login(&a, "locky", "right password", &u) == FD_E_LOCKED);
+
+  // ---- password change clears the lockout and replaces the hash ----
+  th_check("set password", fd_auth_set_password(&a, "locky", "brand new password") == FD_OK);
+  th_check("old password denied", fd_auth_login(&a, "locky", "right password", &u) == FD_E_DENIED);
+  th_check("new password ok", fd_auth_login(&a, "locky", "brand new password", &u) == FD_OK);
+  th_check("set password: missing user", fd_auth_set_password(&a, "nobody", "brand new password") == FD_E_NOT_FOUND);
+  th_check("set password: policy", fd_auth_set_password(&a, "locky", "short") == FD_E_INVALID);
+
+  // ---- setup tool: roles and the admin user ----
+  th_check("reset", fd_system_reset(&db) == FD_OK);
+  th_check("setup bad password", fd_setup_run(&a, "admin", "short") == FD_E_INVALID);
+  th_check("no admin after failed setup", fd_user_get(&db, "admin", &u) == FD_E_NOT_FOUND);
+  th_check("setup", fd_setup_run(&a, "admin", "admin password") == FD_OK);
+  th_check("admin login", fd_auth_login(&a, "admin", "admin password", &u) == FD_OK);
+  th_check("admin role", fd_user_info_role(&u) == "admin");
+  th_check("admin can anything", fd_can(&db, &u, "kick") && fd_can(&db, &u, "upload"));
+  th_check("setup again replaces password", fd_setup_run(&a, "admin", "second password") == FD_OK);
+  th_check("old admin password denied", fd_auth_login(&a, "admin", "admin password", &u) == FD_E_DENIED);
+  th_check("new admin password ok", fd_auth_login(&a, "admin", "second password", &u) == FD_OK);
+  var cnt: int64 = 0;
+  th_check("one user", fd_user_count(&db, &cnt) == FD_OK && cnt == 1);
+  var r: FdRoleInfo;
+  th_check("default roles", fd_role_get(&db, "guest", &r) == FD_OK && fd_role_get(&db, "admin", &r) == FD_OK);
+
+  fd_db_close(&db);
+  return 0;
+}
+
+fn main() -> int32 {
+  var addr: string = th_start(".mbuild/test_auth.meo");
+  if (addr.length == 0) { return 1; }
+  run(addr);
+  th_stop();
+  if (th_failures() > 0) {
+    println("FAIL auth_test: {th_failures()} checks failed");
+    return 1;
+  }
+  println("PASS auth_test");
+  return 0;
+}

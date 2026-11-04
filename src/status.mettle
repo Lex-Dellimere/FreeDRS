@@ -1,0 +1,45 @@
+// freedrs/status: result codes shared by every module (0 = ok, < 0 = error).
+
+export const FD_OK: int32 = 0;
+/// Bad argument (null pointer, empty name, too long).
+export const FD_E_USAGE: int32 = -1;
+/// Input that fails validation (bad JSON, bad port, short password).
+export const FD_E_INVALID: int32 = -2;
+export const FD_E_NOT_FOUND: int32 = -3;
+/// Duplicate name (user, role, path).
+export const FD_E_EXISTS: int32 = -4;
+/// Wrong password, unknown user, or a refused action.
+export const FD_E_DENIED: int32 = -5;
+/// The database (meodb through flux_orm) failed.
+export const FD_E_DB: int32 = -6;
+export const FD_E_NOMEM: int32 = -7;
+/// Too many failed logins; try later.
+export const FD_E_LOCKED: int32 = -8;
+/// Crypto (Argon2id) failed.
+export const FD_E_CRYPTO: int32 = -9;
+/// A directory that still has entries.
+export const FD_E_NOT_EMPTY: int32 = -11;
+/// A path that leaves the root, or holds characters that are not allowed.
+export const FD_E_TRAVERSAL: int32 = -12;
+/// Disk I/O failed (std/file).
+export const FD_E_IO: int32 = -13;
+/// Bigger than the configured limit.
+export const FD_E_TOO_BIG: int32 = -14;
+
+export fn fd_status_text(code: int32) -> string {
+  if (code == FD_OK) { return "ok"; }
+  if (code == FD_E_USAGE) { return "bad argument"; }
+  if (code == FD_E_INVALID) { return "invalid input"; }
+  if (code == FD_E_NOT_FOUND) { return "not found"; }
+  if (code == FD_E_EXISTS) { return "already exists"; }
+  if (code == FD_E_DENIED) { return "denied"; }
+  if (code == FD_E_DB) { return "database error"; }
+  if (code == FD_E_NOMEM) { return "out of memory"; }
+  if (code == FD_E_LOCKED) { return "too many failed logins, try again later"; }
+  if (code == FD_E_CRYPTO) { return "crypto error"; }
+  if (code == FD_E_NOT_EMPTY) { return "directory not empty"; }
+  if (code == FD_E_TRAVERSAL) { return "path traversal not allowed"; }
+  if (code == FD_E_IO) { return "file I/O error"; }
+  if (code == FD_E_TOO_BIG) { return "too large"; }
+  return "unknown error";
+}

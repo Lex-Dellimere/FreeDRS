@@ -1,0 +1,116 @@
+// tests/db_test: the data layer against a real meodb server (embedded, see
+// harness.mettle): roles, users, reset and the file metadata entries. A test
+// program: `mbuild test db`.
+
+import "std/io";
+import "std/mem";
+import "harness";
+import "freedrs/status";
+import "freedrs/auth/roles";
+import "freedrs/db/store";
+import "freedrs/db/models";
+
+fn run(addr: string) -> int32 {
+  var db: FdDb;
+  var rc: int32 = fd_db_open(&db, addr, "");
+  th_check("open", rc == FD_OK);
+  if (rc != FD_OK) { return 1; }
+
+  // ---- reopen is idempotent (migrations are recorded) ----
+  var db2: FdDb;
+  th_check("open twice", fd_db_open(&db2, addr, "") == FD_OK);
+  fd_db_close(&db2);
+
+  // ---- default roles ----
+  var r: FdRoleInfo;
+  th_check("no admin yet", fd_role_get(&db, "admin", &r) == FD_E_NOT_FOUND);
+  th_check("seed", fd_roles_seed(&db) == FD_OK);
+  th_check("seed twice", fd_roles_seed(&db) == FD_OK);
+  th_check("admin role", fd_role_get(&db, "admin", &r) == FD_OK && fd_role_info_commands(&r) == "*");
+  th_check("guest role", fd_role_get(&db, "guest", &r) == FD_OK
+           && fd_role_info_commands(&r) == FD_GUEST_COMMANDS);
+  var roles: FdRoleInfo[8];
+  var n: int32 = 0;
+  th_check("list roles", fd_role_list(&db, &roles[0], 8, &n) == FD_OK && n == 2);
+  th_check("role order", n == 2 && fd_role_info_name(&roles[0]) == "admin"
+           && fd_role_info_name(&roles[1]) == "guest");
+
+  // ---- create / update / delete role ----
+  th_check("create role", fd_role_set(&db, "editor", "list,upload,download") == FD_OK);
+  th_check("get editor", fd_role_get(&db, "editor", &r) == FD_OK
+           && fd_role_info_commands(&r) == "list,upload,download");
+  th_check("update role", fd_role_set(&db, "editor", "list") == FD_OK);
+  th_check("get updated", fd_role_get(&db, "editor", &r) == FD_OK && fd_role_info_commands(&r) == "list");
+  th_check("still 3 roles", fd_role_list(&db, &roles[0], 8, &n) == FD_OK && n == 3);
+  th_check("bad role name", fd_role_set(&db, "bad name", "list") == FD_E_INVALID);
+  th_check("delete role", fd_role_delete(&db, "editor") == FD_OK);
+  th_check("delete role again", fd_role_delete(&db, "editor") == FD_E_NOT_FOUND);
+
+  // ---- users ----
+  var id: int64 = 0;
+  th_check("create user", fd_user_create(&db, "alice", "guest", &id) == FD_OK && id > 0);
+  th_check("duplicate user", fd_user_create(&db, "alice", "guest", &id) == FD_E_EXISTS);
+  th_check("bad user name", fd_user_create(&db, "a b", "guest", &id) == FD_E_INVALID);
+  var u: FdUserInfo;
+  th_check("get user", fd_user_get(&db, "alice", &u) == FD_OK
+           && fd_user_info_name(&u) == "alice" && fd_user_info_role(&u) == "guest" && u.id == id);
+  th_check("get missing user", fd_user_get(&db, "nobody", &u) == FD_E_NOT_FOUND);
+  th_check("set role", fd_user_set_role(&db, "alice", "admin") == FD_OK);
+  th_check("role changed", fd_user_get(&db, "alice", &u) == FD_OK && fd_user_info_role(&u) == "admin");
+  th_check("set role missing user", fd_user_set_role(&db, "nobody", "admin") == FD_E_NOT_FOUND);
+  th_check("create bob", fd_user_create(&db, "bob", "guest", &id) == FD_OK);
+  th_check("rename to taken name", fd_user_rename(&db, "alice", "bob") == FD_E_EXISTS);
+  th_check("rename", fd_user_rename(&db, "alice", "carol") == FD_OK);
+  th_check("old name gone", fd_user_get(&db, "alice", &u) == FD_E_NOT_FOUND);
+  th_check("new name there", fd_user_get(&db, "carol", &u) == FD_OK && fd_user_info_role(&u) == "admin");
+  th_check("rename missing", fd_user_rename(&db, "alice", "dave") == FD_E_NOT_FOUND);
+  var cnt: int64 = 0;
+  th_check("count users", fd_user_count(&db, &cnt) == FD_OK && cnt == 2);
+  var users: FdUserInfo[8];
+  th_check("list users", fd_user_list(&db, &users[0], 8, &n) == FD_OK && n == 2);
+  th_check("list order", n == 2 && fd_user_info_name(&users[0]) == "carol"
+           && fd_user_info_name(&users[1]) == "bob");
+  th_check("delete user", fd_user_delete(&db, "bob") == FD_OK);
+  th_check("delete user again", fd_user_delete(&db, "bob") == FD_E_NOT_FOUND);
+
+  // ---- file metadata entries ----
+  th_check("add dir", fd_entry_add(&db, "docs", FD_KIND_DIR, 0, "carol") == FD_OK);
+  th_check("add file", fd_entry_add(&db, "docs/a.txt", FD_KIND_FILE, 12, "carol") == FD_OK);
+  th_check("add file 2", fd_entry_add(&db, "docs/b.txt", FD_KIND_FILE, 7, "carol") == FD_OK);
+  th_check("add other", fd_entry_add(&db, "top.txt", FD_KIND_FILE, 3, "root") == FD_OK);
+  th_check("duplicate path", fd_entry_add(&db, "top.txt", FD_KIND_FILE, 3, "root") == FD_E_EXISTS);
+  th_check("bad kind", fd_entry_add(&db, "x", 9, 0, "root") == FD_E_INVALID);
+  var ent: FdEntryInfo;
+  th_check("get entry", fd_entry_get(&db, "docs/a.txt", &ent) == FD_OK && ent.kind == FD_KIND_FILE
+           && ent.size == 12 && fd_entry_info_owner(&ent) == "carol");
+  th_check("get missing entry", fd_entry_get(&db, "nope", &ent) == FD_E_NOT_FOUND);
+  var ents: FdEntryInfo[16];
+  th_check("list all", fd_entry_list(&db, "", &ents[0], 16, &n) == FD_OK && n == 4);
+  th_check("list docs/", fd_entry_list(&db, "docs/", &ents[0], 16, &n) == FD_OK && n == 2
+           && fd_entry_info_path(&ents[0]) == "docs/a.txt");
+  th_check("list owner", fd_entry_list_owner(&db, "carol", &ents[0], 16, &n) == FD_OK && n == 3);
+  th_check("delete entry", fd_entry_delete(&db, "docs/a.txt") == FD_OK);
+  th_check("delete entry again", fd_entry_delete(&db, "docs/a.txt") == FD_E_NOT_FOUND);
+
+  // ---- reset system: users and roles wiped, roles re-seeded ----
+  th_check("reset", fd_system_reset(&db) == FD_OK);
+  th_check("users gone", fd_user_count(&db, &cnt) == FD_OK && cnt == 0);
+  th_check("roles reseeded", fd_role_list(&db, &roles[0], 8, &n) == FD_OK && n == 2);
+  th_check("entries kept", fd_entry_list(&db, "", &ents[0], 16, &n) == FD_OK && n == 3);
+
+  fd_db_close(&db);
+  return 0;
+}
+
+fn main() -> int32 {
+  var addr: string = th_start(".mbuild/test_db.meo");
+  if (addr.length == 0) { return 1; }
+  run(addr);
+  th_stop();
+  if (th_failures() > 0) {
+    println("FAIL db_test: {th_failures()} checks failed");
+    return 1;
+  }
+  println("PASS db_test");
+  return 0;
+}

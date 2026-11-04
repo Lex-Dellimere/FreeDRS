@@ -1,0 +1,555 @@
+// freedrs/db/store: the data layer over flux_orm and a meodb server:
+// users, roles and file metadata.
+//
+// Every call checks a session out of a flux_orm pool and back in, so one FdDb
+// serves all threads. Text read from the database is copied into the fixed
+// buffers of the Fd*Info structs before the session goes back, so results
+// never point into a session. Each call returns FD_OK or an FD_E_* code.
+//
+// An FdDb must not move or be copied after fd_db_open (the raize_auth store
+// points at the pool inside it).
+
+import "std/mem";
+import "std/conv";
+import "std/time";
+import "flux_orm/flux_orm";
+import "flux_orm/adapter/meodb";
+import "flux_orm/repo/pool";
+import "raize_auth/auth";
+import "flux_raize_auth/flux_raize_auth";
+import "freedrs/status";
+import "freedrs/auth/roles";
+import "freedrs/db/models";
+
+/// Sessions in the pool: one per concurrent database call.
+export const FD_POOL_SIZE: int32 = 4;
+const FD_WAIT_MS: int32 = 5000;
+/// Longest stored path, in bytes.
+export const FD_PATH_MAX: int32 = 512;
+
+export struct FdDb {
+  pool: RcPool;
+  rfa: RfaStore;   // the raize_auth store context (users table + pool)
+  ra: RaStores;    // raize_auth's stores (credentials, counters, tokens): pass to ra_auth_init
+  is_open: bool;
+}
+
+export struct FdUserInfo {
+  id: int64;
+  username: uint8[64];
+  username_len: int32;
+  role: uint8[64];
+  role_len: int32;
+}
+
+export struct FdRoleInfo {
+  name: uint8[64];
+  name_len: int32;
+  commands: uint8[1024];
+  commands_len: int32;
+}
+
+export struct FdEntryInfo {
+  path: uint8[512];
+  path_len: int32;
+  kind: int32;
+  size: int64;
+  owner: uint8[64];
+  owner_len: int32;
+  created: int64;    // unix seconds
+  modified: int64;   // unix seconds
+}
+
+export fn fd_user_info_name(u: FdUserInfo*) -> string {
+  return str_from_bytes((cstring)&u->username[0], (int64)u->username_len);
+}
+export fn fd_user_info_role(u: FdUserInfo*) -> string {
+  return str_from_bytes((cstring)&u->role[0], (int64)u->role_len);
+}
+export fn fd_role_info_name(r: FdRoleInfo*) -> string {
+  return str_from_bytes((cstring)&r->name[0], (int64)r->name_len);
+}
+export fn fd_role_info_commands(r: FdRoleInfo*) -> string {
+  return str_from_bytes((cstring)&r->commands[0], (int64)r->commands_len);
+}
+export fn fd_entry_info_path(e: FdEntryInfo*) -> string {
+  return str_from_bytes((cstring)&e->path[0], (int64)e->path_len);
+}
+export fn fd_entry_info_owner(e: FdEntryInfo*) -> string {
+  return str_from_bytes((cstring)&e->owner[0], (int64)e->owner_len);
+}
+
+// Copies s into dst (capacity cap), setting *len; truncates, never overflows.
+fn fd_put(dst: uint8*, cap: int32, len: int32*, s: string) {
+  var n: int64 = (int64)s.length;
+  if (n > (int64)cap) { n = (int64)cap; }
+  if (n > 0) { memcpy((rawptr)dst, (rawptr)s.chars, n); }
+  *len = (int32)n;
+}
+
+fn fd_user_fill(out: FdUserInfo*, u: FdUser*) {
+  out->id = u->id;
+  fd_put(&out->username[0], 64, &out->username_len, u->username);
+  fd_put(&out->role[0], 64, &out->role_len, u->role);
+}
+
+fn fd_role_fill(out: FdRoleInfo*, r: FdRole*) {
+  fd_put(&out->name[0], 64, &out->name_len, r->name);
+  fd_put(&out->commands[0], 1024, &out->commands_len, r->commands);
+}
+
+fn fd_entry_fill(out: FdEntryInfo*, e: FdEntry*) {
+  fd_put(&out->path[0], 512, &out->path_len, e->path);
+  out->kind = e->kind;
+  out->size = e->size;
+  fd_put(&out->owner[0], 64, &out->owner_len, e->owner);
+  out->created = e->created;
+  out->modified = e->modified;
+}
+
+// flux_orm status -> FD status.
+fn fd_rc(rc: int32) -> int32 {
+  if (rc == RC_OK) { return FD_OK; }
+  if (rc == RC_ERR_CONFLICT) { return FD_E_EXISTS; }
+  if (rc == RC_ERR_NOT_FOUND) { return FD_E_NOT_FOUND; }
+  if (rc == RC_ERR_NOMEM) { return FD_E_NOMEM; }
+  if (rc == RC_ERR_USAGE) { return FD_E_USAGE; }
+  return FD_E_DB;
+}
+
+fn fd_take(db: FdDb*, s: RcSession**) -> int32 {
+  if (db == 0 || !db->is_open) { return FD_E_USAGE; }
+  if (rc_pool_checkout(&db->pool, FD_WAIT_MS, s) != RC_OK) { return FD_E_DB; }
+  return FD_OK;
+}
+
+fn fd_give(db: FdDb*, s: RcSession*) {
+  rc_pool_checkin(&db->pool, s);
+}
+
+// ---- open / close ----
+
+/// Connects to the meodb server at addr ("ip:port"), creates the tables that
+/// are missing (migrations) and binds the raize_auth store.
+///
+/// in:      db   zeroed by this call; addr  e.g. "127.0.0.1:5490";
+///          token  the meodb token, "" when the server has none
+/// returns: FD_OK; FD_E_DB (no server, handshake or migration failed)
+export fn fd_db_open(db: FdDb*, addr: string, token: string) -> int32 {
+  if (db == 0) { return FD_E_USAGE; }
+  memset((rawptr)db, 0, (int64)sizeof(FdDb));
+  if (rc_meodb_pool(&db->pool, FD_POOL_SIZE, token, addr) != RC_OK) { return FD_E_DB; }
+  db->is_open = true;
+
+  var migs: RcMigration[4];
+  fd_migrations(&migs[0]);
+  rfa_migration(&migs[3], 4);
+  var set: RcMigrationSet = rc_migration_set(&migs[0], 4);
+  var rep: RcMigrationReport;
+  var s: RcSession* = 0;
+  var rc: int32 = fd_take(db, &s);
+  if (rc != FD_OK) { fd_db_close(db); return rc; }
+  var mrc: int32 = rc_migration_run(rc_session_adapter(s), &set, &rep);
+  fd_give(db, s);
+  if (mrc != RC_OK) { fd_db_close(db); return FD_E_DB; }
+
+  db->rfa.pool = &db->pool;
+  db->rfa.users.meta = fd_user_meta();
+  db->rfa.users.login = "username";
+  db->rfa.users.owner = "id";
+  db->rfa.users.hash = "password_hash";
+  db->rfa.users.disabled = "";
+  rfa_stores_bind(&db->ra, &db->rfa);
+  return FD_OK;
+}
+
+/// Closes every connection. Safe on a db that failed to open.
+export fn fd_db_close(db: FdDb*) {
+  if (db == 0 || !db->is_open) { return; }
+  rc_pool_free(&db->pool);
+  db->is_open = false;
+}
+
+// ---- users ----
+
+/// Inserts a user with no password yet (set it with ra_set_password).
+/// returns: FD_OK and *id; FD_E_EXISTS (name taken); FD_E_INVALID (bad name or role)
+export fn fd_user_create(db: FdDb*, username: string, role: string, id: int64*) -> int32 {
+  if (!fd_name_ok(username) || !fd_name_ok(role)) { return FD_E_INVALID; }
+  var s: RcSession* = 0;
+  var rc: int32 = fd_take(db, &s);
+  if (rc != FD_OK) { return rc; }
+  var u: FdUser;
+  memset((rawptr)&u, 0, (int64)sizeof(FdUser));
+  u.username = username;
+  u.password_hash = "";
+  u.role = role;
+  var e: RcEntity = rc_entity_new(fd_user_meta(), (rawptr)&u);
+  rc = fd_rc(rc_repo_insert(s, 0, &e));
+  if (rc == FD_OK && id != 0) { *id = u.id; }
+  fd_give(db, s);
+  return rc;
+}
+
+/// Looks a user up by name. returns FD_OK, FD_E_NOT_FOUND.
+export fn fd_user_get(db: FdDb*, username: string, out: FdUserInfo*) -> int32 {
+  if (out == 0 || username.length == 0) { return FD_E_USAGE; }
+  var s: RcSession* = 0;
+  var rc: int32 = fd_take(db, &s);
+  if (rc != FD_OK) { return rc; }
+  var u: FdUser;
+  var e: RcEntity;
+  rc = fd_rc(rc_repo_get_by(s, fd_user_meta(), "username", RcText(username), (rawptr)&u, &e));
+  if (rc == FD_OK) { fd_user_fill(out, &u); }
+  fd_give(db, s);
+  return rc;
+}
+
+/// Counts users. returns FD_OK and *n.
+export fn fd_user_count(db: FdDb*, n: int64*) -> int32 {
+  if (n == 0) { return FD_E_USAGE; }
+  var s: RcSession* = 0;
+  var rc: int32 = fd_take(db, &s);
+  if (rc != FD_OK) { return rc; }
+  var q: RcQuery = rc_query_count(fd_user_meta());
+  rc = fd_rc(rc_repo_count(s, &q, n));
+  rc_query_free(&q);
+  fd_give(db, s);
+  return rc;
+}
+
+/// Lists up to cap users, oldest first. *n receives how many were copied.
+export fn fd_user_list(db: FdDb*, out: FdUserInfo*, cap: int32, n: int32*) -> int32 {
+  if (out == 0 || n == 0 || cap < 1) { return FD_E_USAGE; }
+  *n = 0;
+  var s: RcSession* = 0;
+  var rc: int32 = fd_take(db, &s);
+  if (rc != FD_OK) { return rc; }
+  var q: RcQuery = rc_query_select(fd_user_meta());
+  rc_query_order_by(&q, "id", RC_ASC);
+  var rows: RcRows;
+  rc = fd_rc(rc_repo_all(s, &q, &rows));
+  rc_query_free(&q);
+  if (rc == FD_OK) {
+    var i: int32 = 0;
+    while (i < rows.n && i < cap) {
+      var u: FdUser;
+      var e: RcEntity;
+      if (rc_rows_get(&rows, i, (rawptr)&u, &e) != RC_OK) { rc = FD_E_DB; break; }
+      fd_user_fill(&out[i], &u);
+      i = i + 1;
+    }
+    *n = i;
+  }
+  fd_give(db, s);
+  return rc;
+}
+
+/// Changes a user's role. returns FD_OK, FD_E_NOT_FOUND, FD_E_INVALID.
+export fn fd_user_set_role(db: FdDb*, username: string, role: string) -> int32 {
+  if (!fd_name_ok(username) || !fd_name_ok(role)) { return FD_E_INVALID; }
+  var s: RcSession* = 0;
+  var rc: int32 = fd_take(db, &s);
+  if (rc != FD_OK) { return rc; }
+  var q: RcQuery = rc_query_update_all(fd_user_meta());
+  rc_query_set(&q, "role", RcText(role));
+  rc_query_where(&q, "username", RC_CMP_EQ, RcText(username));
+  var n: int32 = 0;
+  rc = fd_rc(rc_repo_update_all(s, &q, &n));
+  rc_query_free(&q);
+  if (rc == FD_OK && n == 0) { rc = FD_E_NOT_FOUND; }
+  fd_give(db, s);
+  return rc;
+}
+
+/// Deletes a user. returns FD_OK, FD_E_NOT_FOUND.
+export fn fd_user_delete(db: FdDb*, username: string) -> int32 {
+  if (username.length == 0) { return FD_E_USAGE; }
+  var s: RcSession* = 0;
+  var rc: int32 = fd_take(db, &s);
+  if (rc != FD_OK) { return rc; }
+  var q: RcQuery = rc_query_delete(fd_user_meta());
+  rc_query_where(&q, "username", RC_CMP_EQ, RcText(username));
+  var n: int32 = 0;
+  rc = fd_rc(rc_repo_delete_all(s, &q, &n));
+  rc_query_free(&q);
+  if (rc == FD_OK && n == 0) { rc = FD_E_NOT_FOUND; }
+  fd_give(db, s);
+  return rc;
+}
+
+/// Renames a user. returns FD_OK, FD_E_NOT_FOUND (no old), FD_E_EXISTS (new
+/// name taken), FD_E_INVALID.
+export fn fd_user_rename(db: FdDb*, old_name: string, new_name: string) -> int32 {
+  if (!fd_name_ok(old_name) || !fd_name_ok(new_name)) { return FD_E_INVALID; }
+  var probe: FdUserInfo;
+  var rc: int32 = fd_user_get(db, new_name, &probe);
+  if (rc == FD_OK) { return FD_E_EXISTS; }
+  if (rc != FD_E_NOT_FOUND) { return rc; }
+  var s: RcSession* = 0;
+  rc = fd_take(db, &s);
+  if (rc != FD_OK) { return rc; }
+  var q: RcQuery = rc_query_update_all(fd_user_meta());
+  rc_query_set(&q, "username", RcText(new_name));
+  rc_query_where(&q, "username", RC_CMP_EQ, RcText(old_name));
+  var n: int32 = 0;
+  rc = fd_rc(rc_repo_update_all(s, &q, &n));
+  rc_query_free(&q);
+  if (rc == FD_OK && n == 0) { rc = FD_E_NOT_FOUND; }
+  fd_give(db, s);
+  return rc;
+}
+
+// ---- roles ----
+
+/// Looks a role up by name. returns FD_OK, FD_E_NOT_FOUND.
+export fn fd_role_get(db: FdDb*, name: string, out: FdRoleInfo*) -> int32 {
+  if (out == 0 || name.length == 0) { return FD_E_USAGE; }
+  var s: RcSession* = 0;
+  var rc: int32 = fd_take(db, &s);
+  if (rc != FD_OK) { return rc; }
+  var r: FdRole;
+  var e: RcEntity;
+  rc = fd_rc(rc_repo_get_by(s, fd_role_meta(), "name", RcText(name), (rawptr)&r, &e));
+  if (rc == FD_OK) { fd_role_fill(out, &r); }
+  fd_give(db, s);
+  return rc;
+}
+
+/// Creates a role, or replaces its verb list.
+/// returns FD_OK, FD_E_INVALID (bad name, or a list over FD_COMMANDS_MAX)
+export fn fd_role_set(db: FdDb*, name: string, commands: string) -> int32 {
+  if (!fd_name_ok(name) || (int64)commands.length > (int64)FD_COMMANDS_MAX) { return FD_E_INVALID; }
+  var probe: FdRoleInfo;
+  var rc: int32 = fd_role_get(db, name, &probe);
+  var s: RcSession* = 0;
+  if (rc == FD_E_NOT_FOUND) {
+    rc = fd_take(db, &s);
+    if (rc != FD_OK) { return rc; }
+    var r: FdRole;
+    memset((rawptr)&r, 0, (int64)sizeof(FdRole));
+    r.name = name;
+    r.commands = commands;
+    var e: RcEntity = rc_entity_new(fd_role_meta(), (rawptr)&r);
+    rc = fd_rc(rc_repo_insert(s, 0, &e));
+    fd_give(db, s);
+    return rc;
+  }
+  if (rc != FD_OK) { return rc; }
+  rc = fd_take(db, &s);
+  if (rc != FD_OK) { return rc; }
+  var q: RcQuery = rc_query_update_all(fd_role_meta());
+  rc_query_set(&q, "commands", RcText(commands));
+  rc_query_where(&q, "name", RC_CMP_EQ, RcText(name));
+  var n: int32 = 0;
+  rc = fd_rc(rc_repo_update_all(s, &q, &n));
+  rc_query_free(&q);
+  fd_give(db, s);
+  return rc;
+}
+
+/// Deletes a role. returns FD_OK, FD_E_NOT_FOUND (callers may ignore it).
+export fn fd_role_delete(db: FdDb*, name: string) -> int32 {
+  if (name.length == 0) { return FD_E_USAGE; }
+  var s: RcSession* = 0;
+  var rc: int32 = fd_take(db, &s);
+  if (rc != FD_OK) { return rc; }
+  var q: RcQuery = rc_query_delete(fd_role_meta());
+  rc_query_where(&q, "name", RC_CMP_EQ, RcText(name));
+  var n: int32 = 0;
+  rc = fd_rc(rc_repo_delete_all(s, &q, &n));
+  rc_query_free(&q);
+  if (rc == FD_OK && n == 0) { rc = FD_E_NOT_FOUND; }
+  fd_give(db, s);
+  return rc;
+}
+
+/// Lists up to cap roles. *n receives how many were copied.
+export fn fd_role_list(db: FdDb*, out: FdRoleInfo*, cap: int32, n: int32*) -> int32 {
+  if (out == 0 || n == 0 || cap < 1) { return FD_E_USAGE; }
+  *n = 0;
+  var s: RcSession* = 0;
+  var rc: int32 = fd_take(db, &s);
+  if (rc != FD_OK) { return rc; }
+  var q: RcQuery = rc_query_select(fd_role_meta());
+  rc_query_order_by(&q, "id", RC_ASC);
+  var rows: RcRows;
+  rc = fd_rc(rc_repo_all(s, &q, &rows));
+  rc_query_free(&q);
+  if (rc == FD_OK) {
+    var i: int32 = 0;
+    while (i < rows.n && i < cap) {
+      var r: FdRole;
+      var e: RcEntity;
+      if (rc_rows_get(&rows, i, (rawptr)&r, &e) != RC_OK) { rc = FD_E_DB; break; }
+      fd_role_fill(&out[i], &r);
+      i = i + 1;
+    }
+    *n = i;
+  }
+  fd_give(db, s);
+  return rc;
+}
+
+/// Creates the default roles when missing: admin = "*", guest = the guest
+/// verb list. Existing roles are left as they are.
+export fn fd_roles_seed(db: FdDb*) -> int32 {
+  var probe: FdRoleInfo;
+  var rc: int32 = fd_role_get(db, FD_ROLE_ADMIN, &probe);
+  if (rc == FD_E_NOT_FOUND) { rc = fd_role_set(db, FD_ROLE_ADMIN, FD_ADMIN_COMMANDS); }
+  if (rc != FD_OK) { return rc; }
+  rc = fd_role_get(db, FD_ROLE_GUEST, &probe);
+  if (rc == FD_E_NOT_FOUND) { rc = fd_role_set(db, FD_ROLE_GUEST, FD_GUEST_COMMANDS); }
+  return rc;
+}
+
+/// The verb list of a role, for the permission check. known is false when the
+/// role does not exist (the guest list then applies, see fd_command_forbidden).
+export fn fd_role_commands(db: FdDb*, name: string, out: FdRoleInfo*, known: bool*) -> int32 {
+  var rc: int32 = fd_role_get(db, name, out);
+  if (rc == FD_OK) { *known = true; return FD_OK; }
+  if (rc == FD_E_NOT_FOUND) { *known = false; return FD_OK; }
+  return rc;
+}
+
+/// Wipes every user and role, then re-creates the default roles. File metadata
+/// is kept.
+export fn fd_system_reset(db: FdDb*) -> int32 {
+  var s: RcSession* = 0;
+  var rc: int32 = fd_take(db, &s);
+  if (rc != FD_OK) { return rc; }
+  var n: int32 = 0;
+  var qu: RcQuery = rc_query_delete(fd_user_meta());
+  rc_query_where(&qu, "id", RC_CMP_GT, RcInt(0));
+  rc = fd_rc(rc_repo_delete_all(s, &qu, &n));
+  rc_query_free(&qu);
+  if (rc == FD_OK) {
+    var qr: RcQuery = rc_query_delete(fd_role_meta());
+    rc_query_where(&qr, "id", RC_CMP_GT, RcInt(0));
+    rc = fd_rc(rc_repo_delete_all(s, &qr, &n));
+    rc_query_free(&qr);
+  }
+  fd_give(db, s);
+  if (rc != FD_OK) { return rc; }
+  return fd_roles_seed(db);
+}
+
+// ---- file metadata entries ----
+
+/// Adds a metadata entry. kind is FD_KIND_FILE or FD_KIND_DIR; owner a user name.
+/// returns FD_OK, FD_E_EXISTS (path taken), FD_E_INVALID.
+export fn fd_entry_add(db: FdDb*, path: string, kind: int32, size: int64, owner: string) -> int32 {
+  if (path.length == 0 || (int64)path.length > (int64)FD_PATH_MAX) { return FD_E_INVALID; }
+  if (kind != FD_KIND_FILE && kind != FD_KIND_DIR) { return FD_E_INVALID; }
+  if (size < 0 || !fd_name_ok(owner)) { return FD_E_INVALID; }
+  var s: RcSession* = 0;
+  var rc: int32 = fd_take(db, &s);
+  if (rc != FD_OK) { return rc; }
+  var m: FdEntry;
+  memset((rawptr)&m, 0, (int64)sizeof(FdEntry));
+  m.path = path;
+  m.kind = kind;
+  m.size = size;
+  m.owner = owner;
+  m.created = time_unix();
+  m.modified = m.created;
+  var e: RcEntity = rc_entity_new(fd_entry_meta(), (rawptr)&m);
+  rc = fd_rc(rc_repo_insert(s, 0, &e));
+  fd_give(db, s);
+  return rc;
+}
+
+/// Sets an entry's size and modified time (an upload over an existing file).
+/// returns FD_OK, FD_E_NOT_FOUND.
+export fn fd_entry_touch(db: FdDb*, path: string, size: int64) -> int32 {
+  if (path.length == 0 || size < 0) { return FD_E_USAGE; }
+  var s: RcSession* = 0;
+  var rc: int32 = fd_take(db, &s);
+  if (rc != FD_OK) { return rc; }
+  var q: RcQuery = rc_query_update_all(fd_entry_meta());
+  rc_query_set(&q, "size", RcInt(size));
+  rc_query_set(&q, "modified", RcInt(time_unix()));
+  rc_query_where(&q, "path", RC_CMP_EQ, RcText(path));
+  var n: int32 = 0;
+  rc = fd_rc(rc_repo_update_all(s, &q, &n));
+  rc_query_free(&q);
+  if (rc == FD_OK && n == 0) { rc = FD_E_NOT_FOUND; }
+  fd_give(db, s);
+  return rc;
+}
+
+/// Looks an entry up by exact path. returns FD_OK, FD_E_NOT_FOUND.
+export fn fd_entry_get(db: FdDb*, path: string, out: FdEntryInfo*) -> int32 {
+  if (out == 0 || path.length == 0) { return FD_E_USAGE; }
+  var s: RcSession* = 0;
+  var rc: int32 = fd_take(db, &s);
+  if (rc != FD_OK) { return rc; }
+  var m: FdEntry;
+  var e: RcEntity;
+  rc = fd_rc(rc_repo_get_by(s, fd_entry_meta(), "path", RcText(path), (rawptr)&m, &e));
+  if (rc == FD_OK) { fd_entry_fill(out, &m); }
+  fd_give(db, s);
+  return rc;
+}
+
+/// Deletes an entry by exact path. returns FD_OK, FD_E_NOT_FOUND.
+export fn fd_entry_delete(db: FdDb*, path: string) -> int32 {
+  if (path.length == 0) { return FD_E_USAGE; }
+  var s: RcSession* = 0;
+  var rc: int32 = fd_take(db, &s);
+  if (rc != FD_OK) { return rc; }
+  var q: RcQuery = rc_query_delete(fd_entry_meta());
+  rc_query_where(&q, "path", RC_CMP_EQ, RcText(path));
+  var n: int32 = 0;
+  rc = fd_rc(rc_repo_delete_all(s, &q, &n));
+  rc_query_free(&q);
+  if (rc == FD_OK && n == 0) { rc = FD_E_NOT_FOUND; }
+  fd_give(db, s);
+  return rc;
+}
+
+// Lists entries ordered by path. When owner is non-empty only that owner's
+// entries come back; entries whose path does not start with prefix are skipped.
+fn fd_entry_scan(db: FdDb*, prefix: string, owner: string, out: FdEntryInfo*, cap: int32,
+                 n: int32*) -> int32 {
+  if (out == 0 || n == 0 || cap < 1) { return FD_E_USAGE; }
+  *n = 0;
+  var s: RcSession* = 0;
+  var rc: int32 = fd_take(db, &s);
+  if (rc != FD_OK) { return rc; }
+  var q: RcQuery = rc_query_select(fd_entry_meta());
+  if (owner.length > 0) { rc_query_where(&q, "owner", RC_CMP_EQ, RcText(owner)); }
+  rc_query_order_by(&q, "path", RC_ASC);
+  var rows: RcRows;
+  rc = fd_rc(rc_repo_all(s, &q, &rows));
+  rc_query_free(&q);
+  if (rc == FD_OK) {
+    var i: int32 = 0;
+    var k: int32 = 0;
+    while (i < rows.n && k < cap) {
+      var m: FdEntry;
+      var e: RcEntity;
+      if (rc_rows_get(&rows, i, (rawptr)&m, &e) != RC_OK) { rc = FD_E_DB; break; }
+      if (str_starts_with(m.path, prefix) != 0) {
+        fd_entry_fill(&out[k], &m);
+        k = k + 1;
+      }
+      i = i + 1;
+    }
+    *n = k;
+  }
+  fd_give(db, s);
+  return rc;
+}
+
+/// Lists up to cap entries whose path starts with prefix ("" = all), by path.
+/// The protocol's `list <dir>` passes "<dir>/".
+export fn fd_entry_list(db: FdDb*, prefix: string, out: FdEntryInfo*, cap: int32, n: int32*) -> int32 {
+  return fd_entry_scan(db, prefix, "", out, cap, n);
+}
+
+/// Lists up to cap entries owned by `owner` (the protocol's `myfiles`).
+export fn fd_entry_list_owner(db: FdDb*, owner: string, out: FdEntryInfo*, cap: int32, n: int32*) -> int32 {
+  if (owner.length == 0) { return FD_E_USAGE; }
+  return fd_entry_scan(db, "", owner, out, cap, n);
+}

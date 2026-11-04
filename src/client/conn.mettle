@@ -1,0 +1,243 @@
+// freedrs/client/conn: the client connection.
+//
+// A reader thread turns the socket into lines and queues them (mutex + condvar,
+// std/sync). It swallows heartbeat answers: a line `PONG` and the `CMD_END` after
+// it never reach the caller. A heartbeat thread sends `PING` every 5 s while the
+// REPL is idle (never between a command and its reply, so it cannot land inside
+// an upload) and drops the connection when a PING gets no PONG within 12 s.
+//
+// Callers: fd_conn_open, then fd_conn_send_line / fd_conn_next_line (blocking),
+// fd_conn_busy(true) around a command and its reply, fd_conn_close.
+// One connection per process (module globals).
+
+import "std/mem";
+import "std/conv";
+import "std/time";
+import "std/sync";
+import "std/thread";
+import "std/process";
+import "std/io";
+import "std/socket";
+
+const PING_EVERY_MS: int64 = 5000;
+const PONG_WITHIN_MS: int64 = 12000;
+const LINE_MAX: int64 = 25165824;
+
+struct LineNode {
+  next: LineNode*;
+  len: int64;
+  data: uint8*;
+}
+
+var g_sock: int64 = -1;
+var g_lock: SyncMutex;        // queue, closed, pong state
+var g_cond: SyncCond;
+var g_send_lock: SyncMutex;   // sends, and the busy flag
+var g_head: LineNode*;
+var g_tail: LineNode*;
+var g_closed: bool;
+var g_busy: bool;
+var g_swallow_end: bool;
+var g_ping_sent_ms: int64;    // 0 = no PING waiting for its PONG
+var g_heartbeat: bool;
+var g_gen: int64;             // bumps on every open: old threads stop
+
+// ---- queue ----
+
+fn push_line(data: uint8*, len: int64) {
+  var n: LineNode* = (LineNode*)calloc(1, (int64)sizeof(LineNode));
+  if (n == 0) { return; }
+  n->data = (uint8*)malloc(len + 1);
+  if (n->data == 0) { free((rawptr)n); return; }
+  if (len > 0) { memcpy((rawptr)n->data, (rawptr)data, len); }
+  n->data[len] = (uint8)0;
+  n->len = len;
+  sync_mutex_lock(&g_lock);
+  if (g_tail == 0) { g_head = n; } else { g_tail->next = n; }
+  g_tail = n;
+  sync_cond_signal(&g_cond);
+  sync_mutex_unlock(&g_lock);
+}
+
+fn mark_closed(gen: int64) {
+  sync_mutex_lock(&g_lock);
+  if (gen == g_gen) { g_closed = true; }
+  sync_cond_broadcast(&g_cond);
+  sync_mutex_unlock(&g_lock);
+}
+
+// Handles heartbeat answers; true when the line was one and must be dropped.
+fn swallow(data: uint8*, len: int64) -> bool {
+  var s: string = str_from_bytes((cstring)data, len);
+  sync_mutex_lock(&g_lock);
+  var drop: bool = false;
+  if (s == "PONG" && g_ping_sent_ms != 0) {
+    g_ping_sent_ms = 0;
+    g_swallow_end = true;
+    drop = true;
+  } else if (s == "CMD_END" && g_swallow_end) {
+    g_swallow_end = false;
+    drop = true;
+  }
+  sync_mutex_unlock(&g_lock);
+  return drop;
+}
+
+fn reader_thread(param: cstring) -> uint32 {
+  var gen: int64 = (int64)param;
+  var cap: int64 = 65536;
+  var buf: uint8* = (uint8*)malloc(cap);
+  var len: int64 = 0;
+  var scan: int64 = 0;
+  while (buf != 0 && gen == g_gen) {
+    var i: int64 = scan;
+    var start: int64 = 0;
+    while (i < len) {
+      if (buf[i] == (uint8)10) {
+        var end: int64 = i;
+        if (end > start && buf[end - 1] == (uint8)13) { end = end - 1; }
+        if (!swallow(buf + start, end - start)) { push_line(buf + start, end - start); }
+        start = i + 1;
+      }
+      i = i + 1;
+    }
+    if (start > 0) {
+      if (len > start) { memmove((rawptr)buf, (rawptr)(buf + start), len - start); }
+      len = len - start;
+    }
+    scan = len;
+    if (cap - len < 4096) {
+      if (cap >= LINE_MAX + 65536) { break; }
+      cap = cap * 2;
+      buf = (uint8*)realloc((rawptr)buf, cap);
+      if (buf == 0) { break; }
+    }
+    var n: int64 = sock_recv(g_sock, buf + len, cap - len);
+    if (n == -(int64)NET_EINTR) { continue; }
+    if (n <= 0) { break; }
+    len = len + n;
+  }
+  if (buf != 0) { free((rawptr)buf); }
+  mark_closed(gen);
+  return 0;
+}
+
+fn heartbeat_thread(param: cstring) -> uint32 {
+  var gen: int64 = (int64)param;
+  var last_ping: int64 = time_mono_ms();
+  while (gen == g_gen) {
+    time_sleep_ms(500);
+    if (gen != g_gen) { break; }
+    var now: int64 = time_mono_ms();
+    sync_mutex_lock(&g_lock);
+    var waiting: int64 = g_ping_sent_ms;
+    var closed: bool = g_closed;
+    sync_mutex_unlock(&g_lock);
+    if (closed) { break; }
+    if (waiting != 0 && now - waiting > PONG_WITHIN_MS) {
+      println_err("freedrs: no PONG from the server for 12 s, connection lost");
+      sock_shutdown(g_sock, NET_SHUT_BOTH);   // the reader sees the end
+      break;
+    }
+    if (waiting == 0 && now - last_ping >= PING_EVERY_MS) {
+      sync_mutex_lock(&g_send_lock);
+      if (!g_busy) {
+        sync_mutex_lock(&g_lock);
+        g_ping_sent_ms = now;
+        sync_mutex_unlock(&g_lock);
+        sock_send_all(g_sock, (uint8*)"PING\n".chars, 5);
+        last_ping = now;
+      }
+      sync_mutex_unlock(&g_send_lock);
+    }
+  }
+  return 0;
+}
+
+// ---- API ----
+
+/// Connects (host name or dotted quad) and starts the reader, and the heartbeat
+/// when `heartbeat` is true. returns: true, or false with *msg set.
+export fn fd_conn_open(host: string, port: int32, heartbeat: bool, msg: string*) -> bool {
+  match (tcp_connect(host, port, 5000)) {
+    case Ok(fd): { g_sock = fd; }
+    case Err(e): { *msg = e.message; return false; }
+  }
+  sync_mutex_lock(&g_lock);
+  g_gen = g_gen + 1;
+  g_head = 0;
+  g_tail = 0;
+  g_closed = false;
+  g_swallow_end = false;
+  g_ping_sent_ms = 0;
+  g_busy = false;
+  var gen: int64 = g_gen;
+  sync_mutex_unlock(&g_lock);
+  var h: int64 = CreateThread(0, 0, &reader_thread, (cstring)gen, 0, 0);
+  if (h == 0) { sock_close(g_sock); *msg = "cannot start the reader thread"; return false; }
+  thread_detach(h);
+  g_heartbeat = heartbeat;
+  if (heartbeat) {
+    var hb: int64 = CreateThread(0, 0, &heartbeat_thread, (cstring)gen, 0, 0);
+    if (hb != 0) { thread_detach(hb); }
+  }
+  return true;
+}
+
+/// Sends `line` and a newline. false when the connection is gone.
+export fn fd_conn_send_line(line: string) -> bool {
+  sync_mutex_lock(&g_send_lock);
+  var ok: bool = sock_send_all(g_sock, (uint8*)line.chars, (int64)line.length) >= 0
+              && sock_send_all(g_sock, (uint8*)"\n".chars, 1) >= 0;
+  sync_mutex_unlock(&g_send_lock);
+  return ok;
+}
+
+/// Sends raw bytes (an upload body). false when the connection is gone.
+export fn fd_conn_send_bytes(p: uint8*, n: int64) -> bool {
+  sync_mutex_lock(&g_send_lock);
+  var ok: bool = sock_send_all(g_sock, p, n) >= 0;
+  sync_mutex_unlock(&g_send_lock);
+  return ok;
+}
+
+/// True while a command is in flight (no heartbeat is sent). Set it before
+/// sending a command and clear it after the last reply line.
+export fn fd_conn_busy(on: bool) {
+  sync_mutex_lock(&g_send_lock);
+  g_busy = on;
+  sync_mutex_unlock(&g_send_lock);
+}
+
+/// Waits for the next line. The returned heap string must be freed with
+/// fd_conn_free_line. false: the connection closed and nothing is queued.
+export fn fd_conn_next_line(out: string*) -> bool {
+  sync_mutex_lock(&g_lock);
+  while (g_head == 0 && !g_closed) { sync_cond_wait(&g_cond, &g_lock); }
+  var n: LineNode* = g_head;
+  if (n != 0) {
+    g_head = n->next;
+    if (g_head == 0) { g_tail = 0; }
+  }
+  sync_mutex_unlock(&g_lock);
+  if (n == 0) { return false; }
+  *out = str_from_bytes((cstring)n->data, n->len);
+  free((rawptr)n);   // the node only; the text stays valid until fd_conn_free_line
+  return true;
+}
+
+export fn fd_conn_free_line(s: string) {
+  free((rawptr)s.chars);
+}
+
+/// Closes the connection; the threads stop by themselves.
+export fn fd_conn_close() {
+  sync_mutex_lock(&g_lock);
+  g_gen = g_gen + 1;
+  sync_mutex_unlock(&g_lock);
+  if (g_sock >= 0) {
+    sock_shutdown(g_sock, NET_SHUT_BOTH);
+    sock_close(g_sock);
+    g_sock = -1;
+  }
+}
