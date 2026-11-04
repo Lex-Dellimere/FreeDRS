@@ -1,6 +1,6 @@
 # FreeDRS
 
-FreeDRS is a distributed resource system written in [Mettle](https://github.com/The-Mettle-Project/Mettle). Today it is a file server and command-line client with users, roles and a sandboxed virtual file system. The goal is a cluster of sandboxed nodes that share storage and compute; see [docs/DESIGN.md](docs/DESIGN.md).
+FreeDRS is a distributed resource system written in [Mettle](https://github.com/The-Mettle-Project/Mettle). Today it is a file server and command-line client with users, roles and a sandboxed virtual file system. The goal is a cluster of sandboxed nodes that share storage and compute.
 
 ## Built on
 
