@@ -3,8 +3,8 @@
 //   freedrs_client [HOST[:PORT]] [--guest | --user NAME [--pass PASSWORD]]
 //
 // HOST defaults to 127.0.0.1, PORT to 5555. Without --user/--guest it asks
-// whether to log in, sign up or enter as guest. (The terminal echoes the
-// password: the stdlib cannot turn echo off.) Then a prompt: every line is sent
+// whether to log in, sign up or enter as guest. Passwords are typed with echo
+// off when stdin is a terminal. Then a prompt: every line is sent
 // to the server and the reply printed up to CMD_END. Local commands:
 //   status                      connection state
 //   upload <local> [remote]     read the local file, send it base64 encoded
@@ -17,6 +17,8 @@ import "std/mem";
 import "std/conv";
 import "std/file";
 import "std/process";
+import "std/term";
+import "std/term_os";
 import "std/encoding";
 import "std/socket";
 import "freedrs/client/conn";
@@ -35,6 +37,16 @@ fn read_input(prompt: string, out: string*) -> bool {
   var n: int64 = 0;
   while (n < 2048 && g_line[n] != (uint8)0) { n = n + 1; }
   while (n > 0 && (g_line[n - 1] == (uint8)10 || g_line[n - 1] == (uint8)13)) { n = n - 1; }
+  *out = str_from_bytes((cstring)&g_line[0], n);
+  return true;
+}
+
+// Like read_input, for a password: echo is off when stdin is a terminal.
+// A pipe or file is read as usual.
+fn read_secret(prompt: string, out: string*) -> bool {
+  if (!term_is_tty(0)) { return read_input(prompt, out); }
+  var n: int64 = term_read_secret(prompt, &g_line[0], 2047);
+  if (n < 0) { return false; }
   *out = str_from_bytes((cstring)&g_line[0], n);
   return true;
 }
@@ -256,7 +268,7 @@ fn ask_credentials(creds: Creds*) -> bool {
   var tmp: string;
   if (!read_input("Username: ", &tmp)) { return false; }
   creds->user = dup(tmp);
-  if (!read_input("Password: ", &tmp)) { return false; }
+  if (!read_secret("Password: ", &tmp)) { return false; }
   creds->pass = dup(tmp);
   return true;
 }
@@ -282,7 +294,7 @@ fn prompt_auth(first: Creds*, guest_first: bool) -> bool {
       mode = "g";
     } else if (creds.user.length > 0 && creds.pass.length == 0) {
       var pw: string;
-      if (!read_input("Password for {creds.user}: ", &pw)) { return false; }
+      if (!read_secret("Password for {creds.user}: ", &pw)) { return false; }
       creds.pass = dup(pw);
     } else if (creds.user.length == 0) {
       var ans: string;

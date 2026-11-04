@@ -81,6 +81,11 @@ fn main(argc: int32, argv: cstring*) -> int32 {
     println_err("freedrs_server: cannot open root {fd_config_root(&g_cfg)}: {fd_status_text(rc)}");
     return 1;
   }
+  rc = fd_vfs_refresh(&g_vfs, fd_config_admin_user(&g_cfg), 0);
+  if (rc != FD_OK) {
+    println_err("freedrs_server: cannot scan root {fd_config_root(&g_cfg)}: {fd_status_text(rc)}");
+    return 1;
+  }
 
   var port: int64 = 0;
   var msg: string = "";

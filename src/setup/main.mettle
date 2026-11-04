@@ -3,8 +3,8 @@
 //
 //   freedrs_setup [--meodb IP:PORT] [--admin-user NAME]
 //
-// It asks for the admin password on stdin (the terminal echoes it: the stdlib
-// cannot turn echo off); a pipe works too: `printf 'secret-pass\n' | freedrs_setup`.
+// It asks for the admin password on stdin, with echo off on a terminal; a pipe
+// works too: `printf 'secret-pass\n' | freedrs_setup`.
 // The meodb address defaults to 127.0.0.1:5490 (FD_DEFAULT_MEODB).
 //
 // TODO: ask for the port and root directory and save server_config.json once a
@@ -13,6 +13,8 @@
 import "std/io";
 import "std/mem";
 import "std/conv";
+import "std/term";
+import "std/term_os";
 import "freedrs/status";
 import "freedrs/config/config";
 import "freedrs/auth/auth";
@@ -63,9 +65,17 @@ fn main(argc: int32, argv: cstring*) -> int32 {
     return 1;
   }
 
-  print("Admin user [{admin_user}] password (8+ characters): ");
+  var prompt: string = "Admin user [{admin_user}] password (8+ characters): ";
   var buf: uint8[1100];
-  var pw: string = read_line_stdin((cstring)&buf[0], 1100);
+  var pw: string;
+  if (term_is_tty(0)) {
+    var n: int64 = term_read_secret(prompt, &buf[0], 1099);
+    if (n < 0) { n = 0; }
+    pw = str_from_bytes((cstring)&buf[0], n);
+  } else {
+    print(prompt);
+    pw = read_line_stdin((cstring)&buf[0], 1100);
+  }
   rc = fd_setup_run(&auth, admin_user, pw);
   memset((rawptr)&buf[0], 0, 1100);
   fd_db_close(&db);

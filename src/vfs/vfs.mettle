@@ -1,6 +1,6 @@
 // freedrs/vfs/vfs: the virtual file system.
 //
-// File bytes live under a root directory on disk (std/file, std/dir); the
+// File bytes live under a root directory on disk (std/file, std/fs); the
 // metadata (path, kind, size, owner, created, modified) lives in MeoDB through
 // flux_orm (db/store.mettle: fd_entry_*). A virtual path is a normalised,
 // slash separated string without a leading slash ("" is the root, "docs/a.txt"
@@ -16,16 +16,14 @@
 // One mutex serialises every operation that changes or reads the tree, so
 // check-then-act sequences (exists, then write) are not interleaved.
 //
-// MeoDB is the only source of the entry list: files that appear under the root
-// without going through the server are not adopted into the metadata.
-// TODO: adopt existing files once std/dir can iterate a directory.
-// TODO: remove the directory itself once std/file has rmdir; deleting a
-// directory currently removes only its metadata.
+// MeoDB is the source of the entry list. Files that appear under the root
+// without going through the server are added to it by fd_vfs_refresh (at
+// startup and on the `refresh` command).
 
 import "std/mem";
 import "std/conv";
 import "std/file";
-import "std/dir";
+import "std/fs";
 import "std/sync";
 import "freedrs/status";
 import "freedrs/auth/roles";
@@ -164,20 +162,8 @@ fn fd_disk_path(v: FdVfs*, vpath: string, d: FdDiskPath*) -> bool {
 
 // Creates `disk` and every missing parent. Existing directories are fine.
 fn fd_mkdir_p(disk: string) -> int32 {
-  var tmp: uint8[1024];
-  var n: int64 = (int64)disk.length;
-  if (n >= 1024) { return FD_E_INVALID; }
-  var i: int64 = 1;
-  while (i <= n) {
-    if (i == n || disk.chars[i] == '/') {
-      memcpy((rawptr)&tmp[0], (rawptr)disk.chars, i);
-      tmp[i] = (uint8)0;
-      if (dir_exists((cstring)&tmp[0]) == 0) {
-        if (dir_create((cstring)&tmp[0]) != 0 && dir_exists((cstring)&tmp[0]) == 0) { return FD_E_IO; }
-      }
-    }
-    i = i + 1;
-  }
+  // 0x1ED is mode 0755
+  if (fs_mkdir_all(disk, 0x1ED) != 0) { return FD_E_IO; }
   return FD_OK;
 }
 
@@ -321,13 +307,87 @@ export fn fd_vfs_delete(v: FdVfs*, vpath: string, user: string, is_admin: bool) 
     rc = fd_entry_list(v->db, prefix, &kids[0], 1, &n);
     if (rc != FD_OK) { sync_mutex_unlock(&v->lock); return rc; }
     if (n > 0) { sync_mutex_unlock(&v->lock); return FD_E_NOT_EMPTY; }
-    // TODO: remove the directory once std/file has rmdir.
+    var r: int64 = fs_rmdir(fd_disk_str(&d));
+    if (r == -(int64)FS_ENOTEMPTY) { sync_mutex_unlock(&v->lock); return FD_E_NOT_EMPTY; }
+    if (r < 0 && r != -(int64)FS_ENOENT) { sync_mutex_unlock(&v->lock); return FD_E_IO; }
   } else {
     var r: int64 = file_remove(fd_disk_str(&d));
     if (r < 0 && r != -(int64)FILE_ENOENT) { sync_mutex_unlock(&v->lock); return FD_E_IO; }
   }
   rc = fd_entry_delete(v->db, vpath);
   sync_mutex_unlock(&v->lock);
+  return rc;
+}
+
+// Deepest directory level refresh descends into.
+const FD_WALK_DEPTH: int32 = 32;
+
+// Adds entries for what is on disk under `vdir` and is not in MeoDB yet, then
+// goes into the subdirectories. Symbolic links and other special files are
+// skipped, so the walk stays under the root. Called with the lock held.
+fn fd_walk(v: FdVfs*, vdir: string, owner: string, depth: int32, added: int32*) -> int32 {
+  if (depth > FD_WALK_DEPTH) { return FD_OK; }
+  var dd: FdDiskPath;
+  if (!fd_disk_path(v, vdir, &dd)) { return FD_E_INVALID; }
+  var d: FsDir* = (FsDir*)malloc((int64)sizeof(FsDir));
+  if (d == 0) { return FD_E_NOMEM; }
+  if (fs_dir_open(fd_disk_str(&dd), d) != 0) { free((rawptr)d); return FD_E_IO; }
+  var rc: int32 = FD_OK;
+  var ent: FsDirEntry;
+  var pbuf: uint8[520];
+  while (rc == FD_OK) {
+    var more: int64 = fs_dir_next(d, &ent);
+    if (more < 0) { rc = FD_E_IO; break; }
+    if (more == 0) { break; }
+    if (ent.kind != FS_FILE && ent.kind != FS_DIR) { continue; }
+    var name: string = ent.name;
+    if (name.length == 0 || !fd_seg_ok(name)) { continue; }
+    var n: int64 = (int64)vdir.length;
+    if (n > 0) { n = n + 1; }
+    if (n + (int64)name.length > (int64)FD_PATH_MAX) { continue; }
+    if (vdir.length > 0) {
+      memcpy((rawptr)&pbuf[0], (rawptr)vdir.chars, (int64)vdir.length);
+      pbuf[(int64)vdir.length] = (uint8)'/';
+    }
+    memcpy((rawptr)&pbuf[n], (rawptr)name.chars, (int64)name.length);
+    var vpath: string = str_from_bytes((cstring)&pbuf[0], n + (int64)name.length);
+    var e: FdEntryInfo;
+    rc = fd_entry_get(v->db, vpath, &e);
+    if (rc == FD_E_NOT_FOUND) {
+      var size: int64 = 0;
+      var kind: int32 = FD_KIND_DIR;
+      if (ent.kind == FS_FILE) {
+        kind = FD_KIND_FILE;
+        var dp: FdDiskPath;
+        var st: FsStat;
+        if (!fd_disk_path(v, vpath, &dp) || fs_lstat(fd_disk_str(&dp), &st) != 0) { rc = FD_E_IO; break; }
+        size = st.size;
+      }
+      rc = fd_entry_add(v->db, vpath, kind, size, owner);
+      if (rc == FD_OK) { *added = *added + 1; }
+    } else if (rc == FD_OK && ((e.kind == FD_KIND_DIR) != (ent.kind == FS_DIR))) {
+      continue;   // a file where the metadata says directory, or the reverse
+    }
+    if (rc == FD_OK && ent.kind == FS_DIR) {
+      rc = fd_walk(v, vpath, owner, depth + 1, added);
+    }
+  }
+  fs_dir_close(d);
+  free((rawptr)d);
+  return rc;
+}
+
+/// Adds metadata entries, owned by `owner`, for files and directories that are
+/// on disk under the root but not in MeoDB. Entries already there are left
+/// alone. *added (optional) gets the number of new entries.
+/// returns: FD_OK; FD_E_IO; FD_E_DB
+export fn fd_vfs_refresh(v: FdVfs*, owner: string, added: int32*) -> int32 {
+  if (v == 0) { return FD_E_USAGE; }
+  var n: int32 = 0;
+  sync_mutex_lock(&v->lock);
+  var rc: int32 = fd_walk(v, "", owner, 0, &n);
+  sync_mutex_unlock(&v->lock);
+  if (added != 0) { *added = n; }
   return rc;
 }
 

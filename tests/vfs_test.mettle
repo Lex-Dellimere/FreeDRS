@@ -1,0 +1,84 @@
+// tests/vfs_test: the file system layer against a real meodb server (embedded,
+// see harness.mettle): deleting a directory removes it from disk, and refresh
+// adds entries for files created directly under the root. A test program:
+// `mbuild test vfs`.
+
+import "std/io";
+import "std/mem";
+import "std/fs";
+import "std/file";
+import "harness";
+import "freedrs/status";
+import "freedrs/db/store";
+import "freedrs/db/models";
+import "freedrs/vfs/vfs";
+
+fn write_disk(path: string, text: string) -> bool {
+  var fd: int64 = file_open(path, FILE_WRITE | FILE_CREATE | FILE_TRUNCATE);
+  if (fd < 0) { return false; }
+  var ok: bool = file_write_at(fd, (uint8*)text.chars, (int64)text.length, 0) == (int64)text.length;
+  file_close(fd);
+  return ok;
+}
+
+fn run(addr: string) -> int32 {
+  var db: FdDb;
+  var rc: int32 = fd_db_open(&db, addr, "");
+  th_check("db open", rc == FD_OK);
+  if (rc != FD_OK) { return 1; }
+
+  var root: string = ".mbuild/vfs_root";
+  fs_remove_all(root);
+  var v: FdVfs;
+  th_check("vfs init", fd_vfs_init(&v, &db, root) == FD_OK);
+
+  // ---- deleting a directory removes it from disk ----
+  th_check("mkdir", fd_vfs_mkdir(&v, "docs", "admin") == FD_OK);
+  th_check("dir on disk", fs_is_dir(".mbuild/vfs_root/docs"));
+  th_check("write", fd_vfs_write(&v, "docs/a.txt", (uint8*)"hi", 2, "admin") == FD_OK);
+  th_check("delete non-empty", fd_vfs_delete(&v, "docs", "admin", true) == FD_E_NOT_EMPTY);
+  th_check("dir kept", fs_is_dir(".mbuild/vfs_root/docs"));
+  th_check("delete file", fd_vfs_delete(&v, "docs/a.txt", "admin", true) == FD_OK);
+  th_check("delete dir", fd_vfs_delete(&v, "docs", "admin", true) == FD_OK);
+  th_check("dir gone", !fs_exists(".mbuild/vfs_root/docs"));
+  var e: FdEntryInfo;
+  th_check("entry gone", fd_entry_get(&db, "docs", &e) == FD_E_NOT_FOUND);
+
+  // ---- a file on disk but not in the metadata ----
+  th_check("make dirs", fs_mkdir_all(".mbuild/vfs_root/in/side", 0x1ED) == 0);
+  th_check("disk file", write_disk(".mbuild/vfs_root/in/side/new.txt", "hello world\n"));
+  th_check("disk file top", write_disk(".mbuild/vfs_root/top.txt", "abc"));
+  th_check("not adopted yet", fd_entry_get(&db, "in/side/new.txt", &e) == FD_E_NOT_FOUND);
+  var added: int32 = 0;
+  th_check("refresh", fd_vfs_refresh(&v, "admin", &added) == FD_OK);
+  th_check("added count", added == 4);
+  th_check("file entry", fd_entry_get(&db, "in/side/new.txt", &e) == FD_OK
+           && e.kind == FD_KIND_FILE && e.size == 12 && fd_entry_info_owner(&e) == "admin");
+  th_check("top entry", fd_entry_get(&db, "top.txt", &e) == FD_OK && e.size == 3);
+  th_check("dir entry", fd_entry_get(&db, "in/side", &e) == FD_OK && e.kind == FD_KIND_DIR);
+  var buf: uint8[64];
+  var n: int64 = 0;
+  th_check("read adopted", fd_vfs_read(&v, "in/side/new.txt", &buf[0], 64, &n) == FD_OK && n == 12);
+  th_check("refresh again", fd_vfs_refresh(&v, "admin", &added) == FD_OK && added == 0);
+
+  // a link out of the root is not followed
+  th_check("symlink", fs_symlink("/etc", ".mbuild/vfs_root/etc_link") == 0);
+  th_check("refresh with link", fd_vfs_refresh(&v, "admin", &added) == FD_OK && added == 0);
+  th_check("link not adopted", fd_entry_get(&db, "etc_link", &e) == FD_E_NOT_FOUND);
+
+  fd_db_close(&db);
+  return 0;
+}
+
+fn main() -> int32 {
+  var addr: string = th_start(".mbuild/test_vfs.meo");
+  if (addr.length == 0) { return 1; }
+  run(addr);
+  th_stop();
+  if (th_failures() > 0) {
+    println("FAIL vfs_test: {th_failures()} checks failed");
+    return 1;
+  }
+  println("PASS vfs_test");
+  return 0;
+}

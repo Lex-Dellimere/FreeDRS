@@ -16,6 +16,7 @@ import "std/arena";
 import "std/strbuf";
 import "std/encoding";
 import "freedrs/status";
+import "freedrs/config/config";
 import "freedrs/auth/roles";
 import "freedrs/auth/auth";
 import "freedrs/db/store";
@@ -469,6 +470,12 @@ fn cmd_resetsystem(b: StrBuf*) {
   else { db_err2(b, rc); }
 }
 
+fn cmd_refresh(b: StrBuf*) {
+  var rc: int32 = fd_vfs_refresh(&g_vfs, fd_config_admin_user(&g_cfg), 0);
+  if (rc == FD_OK) { ln(b, "SUCCESS: File system metadata reloaded"); }
+  else { db_err2(b, rc); }
+}
+
 /// Runs one command line (already trimmed, non-empty) and appends the reply.
 /// `ping` is answered without a role check; everything else is checked with
 /// fd_can first. Sets s->action when the session must act.
@@ -502,7 +509,7 @@ export fn fd_cmd_run(s: FdSess*, line: string, b: StrBuf*, a: Arena*) {
     put(b, ")\n");
   }
   else if (verb == "help") { cmd_help(s, b); }
-  else if (verb == "refresh") { ln(b, "SUCCESS: File system metadata reloaded"); }
+  else if (verb == "refresh") { cmd_refresh(b); }
   else if (verb == "listclients") { cmd_listclients(b, a); }
   else if (verb == "clientinfo") { cmd_clientinfo(args, b); }
   else if (verb == "kick") { cmd_kick(s, args, b); }
