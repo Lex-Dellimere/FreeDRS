@@ -1,9 +1,0 @@
-{
-  "port" : 5555,
-  "resourcesPath" : "dfs_root",
-  "db" : {
-    "sqlitePath" : "dfs_database.db"
-  },
-  "adminUser" : "admin",
-  "adminPass" : "admin"
-}
