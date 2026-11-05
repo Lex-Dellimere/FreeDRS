@@ -4,8 +4,8 @@
 //
 // A command appends its reply lines to a StrBuf (each ends in "\n"; the
 // session adds CMD_END) and may set s->action to ask the session for something
-// only it can do: start an upload, send file data, kick a session, close, or
-// stop the node. Role checks go through fd_can (auth/auth.mettle), which reads
+// only it can do: start an upload, stream a download, kick a session, close,
+// or stop the node. The transfers themselves are in xfer.mettle. Role checks go through fd_can (auth/auth.mettle), which reads
 // the role table on every command, so setrole and createrole take effect at
 // once for sessions that are already connected.
 
@@ -14,7 +14,6 @@ import "std/conv";
 import "std/time";
 import "std/arena";
 import "std/strbuf";
-import "std/encoding";
 import "std/fs";
 import "sysinfo";
 import "log/log";
@@ -26,16 +25,14 @@ import "freedrs/db/store";
 import "freedrs/db/models";
 import "freedrs/vfs/vfs";
 import "freedrs/server/state";
+import "freedrs/server/xfer";
 
 export const FD_ACT_NONE: int32 = 0;
-export const FD_ACT_UPLOAD: int32 = 1;    // send READY, then collect base64 lines up to EOF
-export const FD_ACT_BULK: int32 = 2;      // after the reply text: s->bulk, then the download tail
+export const FD_ACT_UPLOAD: int32 = 1;    // send READY, then take SIZE, data lines and EOF
+export const FD_ACT_DOWNLOAD: int32 = 2;  // stream download s->xfer after the reply
 export const FD_ACT_KICK: int32 = 3;      // stop session s->act_arg (a client id)
 export const FD_ACT_QUIT: int32 = 4;      // close after the reply is flushed
 export const FD_ACT_SHUTDOWN: int32 = 5;  // stop the server shortly after the reply
-
-/// The bytes after the bulk data of a download.
-export const FD_DOWNLOAD_TAIL: string = "\nEND_FILE\nSUCCESS: File sent\n";
 
 const FD_LIST_MAX: int32 = 2000;
 
@@ -48,9 +45,11 @@ export struct FdSess {
   cwd_len: int32;
   action: int32;
   act_arg: int64;
+  pid: int64;            // the session actor
   up_path: FdVPath;      // target of a pending upload
-  bulk: uint8*;          // FD_ACT_BULK: base64 text, in the command arena
-  bulk_len: int64;
+  up_lz4: bool;          // the upload asked for LZ4 (--lz4)
+  up_resume: bool;       // and to resume (--resume)
+  xfer: int64;           // FD_ACT_DOWNLOAD: the transfer id
 }
 
 export fn fd_sess_init(s: FdSess*) {
@@ -137,18 +136,6 @@ fn resolve(s: FdSess*, input: string, p: FdVPath*, b: StrBuf*) -> bool {
   return false;
 }
 
-fn entry_line(b: StrBuf*, e: FdEntryInfo*) {
-  put(b, "  ");
-  put(b, fd_entry_info_path(e));
-  if (e->kind == FD_KIND_DIR) { put(b, " [directory] "); } else { put(b, " [file] "); }
-  strbuf_append_int(b, e->size);
-  put(b, "B - ");
-  put(b, fd_entry_info_owner(e));
-  put(b, " (");
-  time_append_iso8601(b, time_utc(e->created * TIME_SECOND), 0);
-  put(b, ")\n");
-}
-
 // ---- file commands ----
 
 fn cmd_list(s: FdSess*, args: string, b: StrBuf*, a: Arena*) {
@@ -177,7 +164,7 @@ fn cmd_list(s: FdSess*, args: string, b: StrBuf*, a: Arena*) {
   if (dir.length == 0) { put(b, "root"); } else { put(b, prefix); }
   put(b, ":\n");
   var i: int32 = 0;
-  while (i < n) { entry_line(b, &ents[i]); i = i + 1; }
+  while (i < n) { fd_entry_line(b, &ents[i]); i = i + 1; }
 }
 
 fn cmd_myfiles(s: FdSess*, b: StrBuf*, a: Arena*) {
@@ -189,7 +176,7 @@ fn cmd_myfiles(s: FdSess*, b: StrBuf*, a: Arena*) {
   if (n == 0) { ln(b, "You don't have any files."); return; }
   ln(b, "Your files:");
   var i: int32 = 0;
-  while (i < n) { entry_line(b, &ents[i]); i = i + 1; }
+  while (i < n) { fd_entry_line(b, &ents[i]); i = i + 1; }
 }
 
 fn cmd_cd(s: FdSess*, args: string, b: StrBuf*) {
@@ -230,9 +217,53 @@ fn cmd_delete(s: FdSess*, args: string, b: StrBuf*) {
   else { err_rc(b, rc); }
 }
 
+// Leading --options of upload and download. false (with the usage error
+// written) for an unknown one.
+fn take_options(args: string, rest: string*, lz4: bool*, resume: bool*, allow_resume: bool, b: StrBuf*,
+                usage: string) -> bool {
+  var r: string = args;
+  while (true) {
+    var w: FdWords = fd_next_word(r);
+    if (str_starts_with(w.word, "--") == 0) { break; }
+    if (w.word == "--lz4") { *lz4 = true; }
+    else if (w.word == "--resume" && allow_resume) { *resume = true; }
+    else { ln(b, usage); return false; }
+    r = w.rest;
+  }
+  *rest = r;
+  return true;
+}
+
+fn all_digits(s: string) -> bool {
+  if (s.length == 0 || s.length > 18) { return false; }
+  var i: int64 = 0;
+  while (i < (int64)s.length) {
+    if (s.chars[i] < '0' || s.chars[i] > '9') { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+/// A byte count: 1 to 18 decimal digits, nothing else. -1 when malformed.
+export fn fd_parse_count(s: string) -> int64 {
+  if (!all_digits(s)) { return -1; }
+  var v: int64 = 0;
+  var i: int64 = 0;
+  while (i < (int64)s.length) {
+    v = v * 10 + (int64)(s.chars[i] - '0');
+    i = i + 1;
+  }
+  return v;
+}
+
 fn cmd_upload(s: FdSess*, args: string, b: StrBuf*) {
-  if (args.length == 0) { ln(b, "ERROR: Usage: upload <local-file-path> [remote-path]"); return; }
-  var w: FdWords = fd_next_word(args);
+  var usage: string = "ERROR: Usage: upload [--lz4] [--resume] <local-file-path> [remote-path]";
+  var rest: string = "";
+  s->up_lz4 = false;
+  s->up_resume = false;
+  if (!take_options(args, &rest, &s->up_lz4, &s->up_resume, true, b, usage)) { return; }
+  if (rest.length == 0) { ln(b, usage); return; }
+  var w: FdWords = fd_next_word(rest);
   var remote: string = w.rest;
   if (remote.length == 0) {
     // default: the basename of the local path
@@ -245,73 +276,34 @@ fn cmd_upload(s: FdSess*, args: string, b: StrBuf*) {
   s->action = FD_ACT_UPLOAD;
 }
 
-/// Finishes an upload: `b64` is every data line concatenated, `too_big` is set
-/// when the session had to drop data. Appends the reply (no READY line).
-export fn fd_cmd_upload_finish(s: FdSess*, b64: string, too_big: bool, b: StrBuf*, a: Arena*) {
-  if (too_big) { err_rc(b, FD_E_TOO_BIG); return; }
-  if (b64.length == 0) { ln(b, "ERROR: No file data received"); return; }
-  var need: int64 = 0;
-  match (base64_decoded_len(b64)) {
-    case Ok(n): { need = n; }
-    case Err(why): { err(b, why); return; }
+// download [--lz4] <path> [offset]: a last word of digits is the offset (give
+// 0 to fetch a path that ends in a number).
+fn cmd_download(s: FdSess*, args: string, b: StrBuf*) {
+  var usage: string = "ERROR: Usage: download [--lz4] <remote-file-path> [offset]";
+  var rest: string = "";
+  var lz4: bool = false;
+  var unused: bool = false;
+  if (!take_options(args, &rest, &lz4, &unused, false, b, usage)) { return; }
+  rest = str_trim(rest);
+  if (rest.length == 0) { ln(b, usage); return; }
+  var offset: int64 = 0;
+  var i: int64 = (int64)rest.length - 1;
+  while (i >= 0 && !is_space((char)rest.chars[i])) { i = i - 1; }
+  if (i > 0) {
+    var last: string = str_slice(rest, i + 1, (int64)rest.length - i - 1);
+    if (all_digits(last)) {
+      offset = fd_parse_count(last);
+      rest = str_trim(str_slice(rest, 0, i));
+    }
   }
-  if (need > FD_VFS_MAX_FILE) { err_rc(b, FD_E_TOO_BIG); return; }
-  var dst: cstring = (cstring)arena_alloc(a, need + 1);
-  if (dst == 0) { err_rc(b, FD_E_NOMEM); return; }
-  var data: string = "";
-  match (base64_decode(b64, dst, need + 1)) {
-    case Ok(d): { data = d; }
-    case Err(why): { err(b, why); return; }
-  }
-  var v: string = fd_vpath_str(&s->up_path);
-  var rc: int32 = fd_vfs_write(&g_vfs, v, (uint8*)data.chars, (int64)data.length,
-                               fd_user_info_name(&s->user));
-  if (rc != FD_OK) {
-    if (rc == FD_E_INVALID) { put(b, "ERROR: Cannot write "); ln(b, v); }
-    else { err_rc(b, rc); }
-    return;
-  }
-  put(b, "SUCCESS: File uploaded: ");
-  var e: FdEntryInfo;
-  if (fd_entry_get(&g_db, v, &e) == FD_OK) {
-    // the same line format as `list`, without its leading indent
-    var line: StrBuf* = strbuf_new(a, 256);
-    entry_line(line, &e);
-    var t: string = str_trim(strbuf_finish_string(line));
-    ln(b, t);
-  } else {
-    ln(b, v);
-  }
-}
-
-fn cmd_download(s: FdSess*, args: string, b: StrBuf*, a: Arena*) {
-  if (args.length == 0) { ln(b, "ERROR: Usage: download <remote-file-path>"); return; }
   var p: FdVPath;
-  if (!resolve(s, args, &p, b)) { return; }
+  if (!resolve(s, rest, &p, b)) { return; }
   var v: string = fd_vpath_str(&p);
-  var size: int64 = 0;
-  var rc: int32 = FD_E_NOT_FOUND;
-  if (v.length > 0) { rc = fd_vfs_size(&g_vfs, v, &size); }
-  if (rc != FD_OK) { put(b, "ERROR: File not found: "); ln(b, v); return; }
-  var raw: uint8* = (uint8*)arena_alloc(a, size + 1);
-  if (raw == 0) { err_rc(b, FD_E_NOMEM); return; }
-  var n: int64 = 0;
-  rc = fd_vfs_read(&g_vfs, v, raw, size + 1, &n);
-  if (rc == FD_E_NOT_FOUND) { put(b, "ERROR: File not found: "); ln(b, v); return; }
-  if (rc != FD_OK) { err_rc(b, rc); return; }
-  var elen: int64 = 0;
-  match (base64_encoded_len(n)) {
-    case Ok(l): { elen = l; }
-    case Err(why): { err(b, why); return; }
-  }
-  var enc: cstring = (cstring)arena_alloc(a, elen + 1);
-  if (enc == 0) { err_rc(b, FD_E_NOMEM); return; }
-  match (base64_encode(str_from_bytes((cstring)raw, n), enc, elen + 1)) {
-    case Ok(out): { s->bulk = (uint8*)out.chars; s->bulk_len = (int64)out.length; }
-    case Err(why): { err(b, why); return; }
-  }
-  ln(b, "FILE_DATA:");
-  s->action = FD_ACT_BULK;
+  if (v.length == 0) { put(b, "ERROR: File not found: "); ln(b, v); return; }
+  var id: int64 = 0;
+  if (fd_xfer_down_begin(fd_user_info_name(&s->user), v, s->pid, offset, lz4, b, &id) != FD_OK) { return; }
+  s->xfer = id;
+  s->action = FD_ACT_DOWNLOAD;
 }
 
 // ---- info commands ----
@@ -343,7 +335,9 @@ fn cmd_help(s: FdSess*, b: StrBuf*) {
   }
   ln(b, "Examples:");
   ln(b, "  upload /home/user/file.txt");
+  ln(b, "  upload --lz4 --resume big.iso isos/big.iso");
   ln(b, "  download file.txt");
+  ln(b, "  download --lz4 isos/big.iso");
   ln(b, "  list .");
   ln(b, "  delete oldfile.txt");
 }
@@ -538,6 +532,28 @@ fn cmd_createrole(args: string, b: StrBuf*) {
   else { db_err2(b, rc); }
 }
 
+fn cmd_setquota(args: string, b: StrBuf*) {
+  var w: FdWords = fd_next_word(args);
+  var n: int64 = fd_parse_count(str_trim(w.rest));
+  if (w.word.length == 0 || n <= 0) { ln(b, "ERROR: Usage: setquota <username> <bytes>"); return; }
+  var rc: int32 = fd_user_set_quota(&g_db, w.word, n);
+  if (rc == FD_OK) { put(b, "SUCCESS: Quota updated for "); ln(b, w.word); }
+  else if (rc == FD_E_NOT_FOUND) { ln(b, "ERROR: User not found"); }
+  else if (rc == FD_E_INVALID) { ln(b, "ERROR: Usage: setquota <username> <bytes>"); }
+  else { db_err2(b, rc); }
+}
+
+fn cmd_setmaxfile(args: string, b: StrBuf*) {
+  var w: FdWords = fd_next_word(args);
+  var n: int64 = fd_parse_count(str_trim(w.rest));
+  if (w.word.length == 0 || n <= 0) { ln(b, "ERROR: Usage: setmaxfile <role> <bytes>"); return; }
+  var rc: int32 = fd_role_set_max_file(&g_db, w.word, n);
+  if (rc == FD_OK) { put(b, "SUCCESS: Max file size updated for "); ln(b, w.word); }
+  else if (rc == FD_E_NOT_FOUND) { ln(b, "ERROR: Role not found"); }
+  else if (rc == FD_E_INVALID) { ln(b, "ERROR: Usage: setmaxfile <role> <bytes>"); }
+  else { db_err2(b, rc); }
+}
+
 fn cmd_deleterole(args: string, b: StrBuf*) {
   if (args.length == 0) { ln(b, "ERROR: Usage: deleterole <role>"); return; }
   var rc: int32 = fd_role_delete(&g_db, args);
@@ -582,8 +598,7 @@ fn cmd_refresh(b: StrBuf*) {
 /// fd_can first. Sets s->action when the session must act.
 export fn fd_cmd_run(s: FdSess*, line: string, b: StrBuf*, a: Arena*) {
   s->action = FD_ACT_NONE;
-  s->bulk = 0;
-  s->bulk_len = 0;
+  s->xfer = 0;
   if (line.length == 0) { ln(b, "ERROR: Empty command"); return; }
   var w: FdWords = fd_next_word(line);
   var vbuf: uint8[32];
@@ -604,7 +619,7 @@ export fn fd_cmd_run(s: FdSess*, line: string, b: StrBuf*, a: Arena*) {
   else if (verb == "mkdir") { cmd_mkdir(s, args, b); }
   else if (verb == "delete") { cmd_delete(s, args, b); }
   else if (verb == "upload") { cmd_upload(s, args, b); }
-  else if (verb == "download") { cmd_download(s, args, b, a); }
+  else if (verb == "download") { cmd_download(s, args, b); }
   else if (verb == "whoami") {
     put(b, "You are client #");
     strbuf_append_int(b, s->client_id);
@@ -622,6 +637,8 @@ export fn fd_cmd_run(s: FdSess*, line: string, b: StrBuf*, a: Arena*) {
   else if (verb == "listroles") { cmd_listroles(b, a); }
   else if (verb == "createrole") { cmd_createrole(args, b); }
   else if (verb == "deleterole") { cmd_deleterole(args, b); }
+  else if (verb == "setquota") { cmd_setquota(args, b); }
+  else if (verb == "setmaxfile") { cmd_setmaxfile(args, b); }
   else if (verb == "deleteuser") { cmd_deleteuser(args, b); }
   else if (verb == "renameuser") { cmd_renameuser(args, b); }
   else if (verb == "resetsystem") { cmd_resetsystem(b); }

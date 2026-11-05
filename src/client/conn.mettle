@@ -8,7 +8,10 @@
 //
 // Callers: fd_conn_open, then fd_conn_send_line / fd_conn_next_line (blocking),
 // fd_conn_busy(true) around a command and its reply, fd_conn_close.
-// One connection per process (module globals).
+// One connection per process (module globals). The queue holds at most
+// QUEUE_MAX bytes: past that the reader stops reading, so a download that is
+// written out slower than it arrives pushes back on the server instead of
+// filling memory.
 //
 // With fd_conn_use_tls the connection runs over TLS (mtls). The handshake is
 // done in fd_conn_open, before the threads start. After that the reader reads
@@ -28,7 +31,8 @@ import "mtls/mtls";
 
 const PING_EVERY_MS: int64 = 5000;
 const PONG_WITHIN_MS: int64 = 12000;
-const LINE_MAX: int64 = 25165824;
+const LINE_MAX: int64 = 1048576;
+const QUEUE_MAX: int64 = 8388608;
 
 struct LineNode {
   next: LineNode*;
@@ -43,6 +47,7 @@ var g_send_lock: SyncMutex;   // sends, and the busy flag
 var g_head: LineNode*;
 var g_tail: LineNode*;
 var g_closed: bool;
+var g_queued: int64;          // bytes of text in the queue
 var g_busy: bool;
 var g_swallow_end: bool;
 var g_ping_sent_ms: int64;    // 0 = no PING waiting for its PONG
@@ -102,19 +107,30 @@ fn tls_start(host: string, msg: string*) -> bool {
 
 // ---- queue ----
 
-fn push_line(data: uint8*, len: int64) {
+// Queues a line, first waiting while the queue is full. false when the
+// connection is being closed (gen is old) or there is no memory.
+fn push_line(gen: int64, data: uint8*, len: int64) -> bool {
   var n: LineNode* = (LineNode*)calloc(1, (int64)sizeof(LineNode));
-  if (n == 0) { return; }
+  if (n == 0) { return false; }
   n->data = (uint8*)malloc(len + 1);
-  if (n->data == 0) { free((rawptr)n); return; }
+  if (n->data == 0) { free((rawptr)n); return false; }
   if (len > 0) { memcpy((rawptr)n->data, (rawptr)data, len); }
   n->data[len] = (uint8)0;
   n->len = len;
   sync_mutex_lock(&g_lock);
+  while (g_queued > QUEUE_MAX && gen == g_gen) { sync_cond_wait(&g_cond, &g_lock); }
+  if (gen != g_gen) {
+    sync_mutex_unlock(&g_lock);
+    free((rawptr)n->data);
+    free((rawptr)n);
+    return false;
+  }
   if (g_tail == 0) { g_head = n; } else { g_tail->next = n; }
   g_tail = n;
-  sync_cond_signal(&g_cond);
+  g_queued = g_queued + len;
+  sync_cond_broadcast(&g_cond);
   sync_mutex_unlock(&g_lock);
+  return true;
 }
 
 fn mark_closed(gen: int64) {
@@ -147,6 +163,7 @@ fn reader_thread(param: cstring) -> uint32 {
   var buf: uint8* = (uint8*)malloc(cap);
   var len: int64 = 0;
   var scan: int64 = 0;
+  var stop: bool = false;
   while (buf != 0 && gen == g_gen) {
     var i: int64 = scan;
     var start: int64 = 0;
@@ -154,11 +171,12 @@ fn reader_thread(param: cstring) -> uint32 {
       if (buf[i] == (uint8)10) {
         var end: int64 = i;
         if (end > start && buf[end - 1] == (uint8)13) { end = end - 1; }
-        if (!swallow(buf + start, end - start)) { push_line(buf + start, end - start); }
+        if (!swallow(buf + start, end - start) && !push_line(gen, buf + start, end - start)) { stop = true; break; }
         start = i + 1;
       }
       i = i + 1;
     }
+    if (stop) { break; }
     if (start > 0) {
       if (len > start) { memmove((rawptr)buf, (rawptr)(buf + start), len - start); }
       len = len - start;
@@ -251,6 +269,7 @@ export fn fd_conn_open(host: string, port: int32, heartbeat: bool, msg: string*)
   g_gen = g_gen + 1;
   g_head = 0;
   g_tail = 0;
+  g_queued = 0;
   g_closed = false;
   g_swallow_end = false;
   g_ping_sent_ms = 0;
@@ -290,21 +309,49 @@ export fn fd_conn_busy(on: bool) {
   sync_mutex_unlock(&g_send_lock);
 }
 
+// Takes the first queued line, if any. Called with g_lock held.
+fn pop_line() -> LineNode* {
+  var n: LineNode* = g_head;
+  if (n != 0) {
+    g_head = n->next;
+    if (g_head == 0) { g_tail = 0; }
+    g_queued = g_queued - n->len;
+    sync_cond_broadcast(&g_cond);   // the reader may wait for room
+  }
+  return n;
+}
+
 /// Waits for the next line. The returned heap string must be freed with
 /// fd_conn_free_line. false: the connection closed and nothing is queued.
 export fn fd_conn_next_line(out: string*) -> bool {
   sync_mutex_lock(&g_lock);
   while (g_head == 0 && !g_closed) { sync_cond_wait(&g_cond, &g_lock); }
-  var n: LineNode* = g_head;
-  if (n != 0) {
-    g_head = n->next;
-    if (g_head == 0) { g_tail = 0; }
-  }
+  var n: LineNode* = pop_line();
   sync_mutex_unlock(&g_lock);
   if (n == 0) { return false; }
   *out = str_from_bytes((cstring)n->data, n->len);
   free((rawptr)n);   // the node only; the text stays valid until fd_conn_free_line
   return true;
+}
+
+/// Like fd_conn_next_line without waiting: false when no line is queued (or
+/// the connection is closed; see fd_conn_closed).
+export fn fd_conn_try_line(out: string*) -> bool {
+  sync_mutex_lock(&g_lock);
+  var n: LineNode* = pop_line();
+  sync_mutex_unlock(&g_lock);
+  if (n == 0) { return false; }
+  *out = str_from_bytes((cstring)n->data, n->len);
+  free((rawptr)n);
+  return true;
+}
+
+/// True once the server closed the connection (lines may still be queued).
+export fn fd_conn_closed() -> bool {
+  sync_mutex_lock(&g_lock);
+  var c: bool = g_closed;
+  sync_mutex_unlock(&g_lock);
+  return c;
 }
 
 export fn fd_conn_free_line(s: string) {
@@ -330,6 +377,7 @@ export fn fd_conn_close() {
   if (g_sock < 0) { return; }
   sync_mutex_lock(&g_lock);
   g_gen = g_gen + 1;
+  sync_cond_broadcast(&g_cond);   // a reader waiting for room stops
   sync_mutex_unlock(&g_lock);
   net_shutdown();
   if (g_reader != 0) { thread_join_infinite(g_reader); thread_close(g_reader); g_reader = 0; }

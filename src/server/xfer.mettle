@@ -1,0 +1,755 @@
+// freedrs/server/xfer: streaming uploads and downloads.
+//
+// A transfer lives in a slot of a fixed table (one mutex guards it). The
+// session actor keeps only the slot's id; the jobs it sends to the worker pool
+// do the work on the slot: decode and write a data line, check the hash and
+// commit, read and encode the next pieces of a download. A slot is `busy`
+// while one job works on it, and only that job touches its file, hash and
+// buffers then, so the lock is never held across disk IO.
+//
+// Upload: fd_xfer_up_begin (after SIZE: limits, then a new temp file, or the
+// user's own partial upload of the same path and size when resuming),
+// fd_xfer_up_data per line, fd_xfer_up_end (EOF: hash, fsync, rename, entry).
+// A broken session leaves a partial upload (some bytes written) kept for
+// g_xfer_keep_ms so `upload --resume` can go on from its offset; the sweep
+// removes it after that. Bad data discards the upload at once.
+//
+// Download: fd_xfer_down_begin (open, FILE_DATA), fd_xfer_down_read per batch
+// of pieces; the session asks for the next batch only when its output has
+// drained (session.mettle).
+//
+// A session that ends detaches its slots (fd_xfer_detach, from its exit
+// hook). Should a job create a slot after that, the session never touches it
+// again (fd_xfer_touch) and the sweep detaches it.
+
+import "std/mem";
+import "std/conv";
+import "std/time";
+import "std/sync";
+import "std/file";
+import "std/strbuf";
+import "std/encoding";
+import "crypto/crypto";
+import "press/press";
+import "log/log";
+import "freedrs/status";
+import "freedrs/auth/roles";
+import "freedrs/db/store";
+import "freedrs/db/models";
+import "freedrs/vfs/vfs";
+import "freedrs/server/state";
+
+/// Raw bytes one data line may carry (READY advertises it).
+export const FD_CHUNK_MAX: int64 = 65536;
+/// Longest data line: the base64 of FD_CHUNK_MAX bytes.
+export const FD_LINE_MAX: int64 = 87384;
+/// Raw bytes per download line: a multiple of 3, so every line decodes alone.
+const DL_PIECE: int64 = 65535;
+/// With LZ4 a little less, so the frame of an incompressible piece still fits.
+const DL_PIECE_LZ4: int64 = 65472;
+/// Download lines per read job.
+const DL_BATCH: int32 = 8;
+
+const XFER_MAX: int32 = 512;
+const PARTIALS_PER_USER: int32 = 8;
+
+const KIND_UP: int32 = 1;
+const KIND_DOWN: int32 = 2;
+
+/// A transfer with no data for this long is ended by its session.
+export var g_xfer_stall_ms: int64 = 60000;
+/// How long a partial upload is kept for `upload --resume`.
+export var g_xfer_keep_ms: int64 = 86400000;
+/// How often the acceptor runs fd_xfer_sweep.
+export var g_xfer_sweep_ms: int64 = 30000;
+
+/// How often a session in a transfer checks for a stall and touches its slot.
+export fn fd_xfer_tick_ms() -> int64 {
+  var t: int64 = g_xfer_stall_ms / 4;
+  if (t < 50) { t = 50; }
+  if (t > 5000) { t = 5000; }
+  return t;
+}
+
+struct FdXfer {
+  used: bool;
+  kind: int32;
+  id: int64;
+  pid: int64;        // the session using it; 0 for a kept partial upload
+  busy: bool;        // a job works on it
+  gone: bool;        // the session ended while busy: detach when the job is done
+  user: uint8[64];
+  user_len: int32;
+  path: FdVPath;
+  tmp: FdTmpName;    // upload: the temp file (len 0 once renamed)
+  fd: int64;         // -1 when closed
+  size: int64;       // upload: the declared size; download: the file size
+  off: int64;        // upload: bytes written; download: the next byte to send
+  lz4: bool;
+  quota: int64;      // upload: checked again at commit
+  hashing: bool;     // download: sha covers every byte from 0
+  want: uint8[64];   // download: the stored hash, want_len 0 when unknown
+  want_len: int32;
+  sha: CrSha256State;
+  raw: uint8*;       // FD_CHUNK_MAX + 64 bytes
+  text: uint8*;      // FD_LINE_MAX + 64 bytes
+  pb: PressBuf;
+  touched: int64;    // mono ms
+  expires: int64;    // mono ms, kept partials only
+}
+
+var g_x: FdXfer[512];
+var g_x_lock: SyncMutex;
+var g_x_next: int64 = 1;
+
+fn x_user(x: FdXfer*) -> string {
+  return str_from_bytes((cstring)&x->user[0], (int64)x->user_len);
+}
+
+fn x_path(x: FdXfer*) -> string {
+  return fd_vpath_str(&x->path);
+}
+
+fn x_close(x: FdXfer*) {
+  if (x->fd >= 0) { file_close(x->fd); x->fd = -1; }
+}
+
+// Frees a slot: closes the file, removes the temp file, frees the buffers.
+// Called with the lock held.
+fn x_free(x: FdXfer*) {
+  x_close(x);
+  if (x->tmp.len > 0) { fd_vfs_tmp_remove(&g_vfs, fd_tmp_name_str(&x->tmp)); x->tmp.len = 0; }
+  if (x->raw != 0) { free((rawptr)x->raw); x->raw = 0; }
+  if (x->text != 0) { free((rawptr)x->text); x->text = 0; }
+  press_buf_free(&x->pb);
+  cr_wipe((uint8*)&x->sha, (int64)sizeof(CrSha256State));
+  x->used = false;
+}
+
+// The session is gone: an upload with bytes written is kept for resume, with
+// at most PARTIALS_PER_USER per user (the oldest goes); anything else is
+// freed. Called with the lock held.
+fn x_detach(x: FdXfer*) {
+  x->gone = false;
+  if (x->kind != KIND_UP || x->off <= 0 || x->tmp.len == 0) { x_free(x); return; }
+  x_close(x);
+  if (x->raw != 0) { free((rawptr)x->raw); x->raw = 0; }
+  if (x->text != 0) { free((rawptr)x->text); x->text = 0; }
+  press_buf_free(&x->pb);
+  x->pid = 0;
+  x->expires = time_mono_ms() + g_xfer_keep_ms;
+  var user: string = x_user(x);
+  while (true) {
+    var n: int32 = 0;
+    var oldest: int32 = -1;
+    var i: int32 = 0;
+    while (i < XFER_MAX) {
+      var y: FdXfer* = &g_x[i];
+      if (y->used && y->kind == KIND_UP && y->pid == 0 && !y->busy && x_user(y) == user) {
+        n = n + 1;
+        if (oldest < 0 || y->expires < g_x[oldest].expires) { oldest = i; }
+      }
+      i = i + 1;
+    }
+    if (n <= PARTIALS_PER_USER || oldest < 0) { break; }
+    x_free(&g_x[oldest]);
+  }
+}
+
+// Takes the slot `id` of kind `kind` for a job of session `pid`. 0 when there
+// is none (or it belongs to another session, or another job has it).
+fn x_claim(id: int64, kind: int32, pid: int64) -> FdXfer* {
+  var found: FdXfer* = (FdXfer*)0;
+  sync_mutex_lock(&g_x_lock);
+  var i: int32 = 0;
+  while (i < XFER_MAX) {
+    var x: FdXfer* = &g_x[i];
+    if (x->used && x->id == id) {
+      if (x->kind == kind && x->pid == pid && !x->busy) {
+        x->busy = true;
+        x->touched = time_mono_ms();
+        found = x;
+      }
+      break;
+    }
+    i = i + 1;
+  }
+  sync_mutex_unlock(&g_x_lock);
+  return found;
+}
+
+// Gives a claimed slot back.
+fn x_release(x: FdXfer*) {
+  sync_mutex_lock(&g_x_lock);
+  x->busy = false;
+  x->touched = time_mono_ms();
+  if (x->gone) { x_detach(x); }
+  sync_mutex_unlock(&g_x_lock);
+}
+
+// Ends a claimed slot (done, or discarded).
+fn x_drop(x: FdXfer*) {
+  sync_mutex_lock(&g_x_lock);
+  x_free(x);
+  sync_mutex_unlock(&g_x_lock);
+}
+
+// A free slot, marked used and busy for `pid`. Called with the lock held.
+fn x_new(kind: int32, pid: int64, user: string, path: string) -> FdXfer* {
+  var i: int32 = 0;
+  while (i < XFER_MAX) {
+    var x: FdXfer* = &g_x[i];
+    if (!x->used) {
+      memset((rawptr)x, 0, (int64)sizeof(FdXfer));
+      x->used = true;
+      x->busy = true;
+      x->kind = kind;
+      x->id = g_x_next;
+      g_x_next = g_x_next + 1;
+      x->pid = pid;
+      x->fd = -1;
+      var un: int64 = (int64)user.length;
+      if (un > 64) { un = 64; }
+      memcpy((rawptr)&x->user[0], (rawptr)user.chars, un);
+      x->user_len = (int32)un;
+      memcpy((rawptr)&x->path.buf[0], (rawptr)path.chars, (int64)path.length);
+      x->path.len = (int32)path.length;
+      x->touched = time_mono_ms();
+      return x;
+    }
+    i = i + 1;
+  }
+  return (FdXfer*)0;
+}
+
+// The work buffers of a claimed slot. false: no memory.
+fn x_buffers(x: FdXfer*) -> bool {
+  if (x->raw == 0) { x->raw = (uint8*)malloc(FD_CHUNK_MAX + 64); }
+  if (x->text == 0) { x->text = (uint8*)malloc(FD_LINE_MAX + 64); }
+  return x->raw != 0 && x->text != 0;
+}
+
+fn ln(b: StrBuf*, s: string) {
+  strbuf_append_string(b, s);
+  strbuf_append_byte(b, (uint8)10);
+}
+
+fn put(b: StrBuf*, s: string) {
+  strbuf_append_string(b, s);
+}
+
+fn put_int(b: StrBuf*, n: int64) {
+  strbuf_append_int(b, n);
+}
+
+// The text appended to b since `start`, without the newline.
+fn since(b: StrBuf*, start: int64) -> string {
+  var n: int64 = b->len - start;
+  if (n > 0 && ((uint8*)b->data)[b->len - 1] == (uint8)10) { n = n - 1; }
+  return str_from_bytes((cstring)((int64)b->data + start), n);
+}
+
+/// One `list` line for an entry, with its leading indent.
+export fn fd_entry_line(b: StrBuf*, e: FdEntryInfo*) {
+  strbuf_append_string(b, "  ");
+  strbuf_append_string(b, fd_entry_info_path(e));
+  if (e->kind == FD_KIND_DIR) { strbuf_append_string(b, " [directory] "); } else { strbuf_append_string(b, " [file] "); }
+  strbuf_append_int(b, e->size);
+  strbuf_append_string(b, "B - ");
+  strbuf_append_string(b, fd_entry_info_owner(e));
+  strbuf_append_string(b, " (");
+  time_append_iso8601(b, time_utc(e->created * TIME_SECOND), 0);
+  strbuf_append_string(b, ")\n");
+}
+
+// Lowercase hex of a digest into out (65 bytes).
+fn hex32(d: CrSha256*, out: uint8*) -> string {
+  var hl: int64 = 0;
+  cr_hex_encode(out, 65, &hl, &d->b[0], 32);
+  return str_from_bytes((cstring)out, 64);
+}
+
+// ---- uploads ----
+
+/// What an upload asks for, from the session.
+export struct FdUpReq {
+  user: string;
+  role: string;
+  path: string;     // a resolved virtual path
+  pid: int64;       // the session
+  size: int64;
+  lz4: bool;
+  resume: bool;
+}
+
+/// Starts an upload of r->size bytes to r->path, after the checks: the role's
+/// max_file, the user's quota (stored bytes, plus the user's other uploads in
+/// progress) and no directory at the path. With r->resume, the user's partial
+/// upload of the same path and size goes on where it stopped. Appends
+/// `OFFSET <n>` and sets *id, or appends one ERROR line.
+/// returns: FD_OK; or the refusal's FD_E_ code
+export fn fd_xfer_up_begin(r: FdUpReq*, b: StrBuf*, id: int64*) -> int32 {
+  *id = 0;
+  var role: FdRoleInfo;
+  var max: int64 = FD_DEFAULT_MAX_FILE;
+  if (fd_role_get(&g_db, r->role, &role) == FD_OK) { max = fd_limit_or(role.max_file, FD_DEFAULT_MAX_FILE); }
+  if (r->size > max) {
+    log_warn(fd_log(), "upload refused, too large", log_str("user", r->user), log_str("path", r->path),
+             log_int("size", r->size), log_int("limit", max));
+    put(b, "ERROR: File too large: ");
+    put_int(b, r->size);
+    put(b, " bytes (your limit is ");
+    put_int(b, max);
+    ln(b, ")");
+    return FD_E_TOO_BIG;
+  }
+  var u: FdUserInfo;
+  var quota: int64 = FD_DEFAULT_QUOTA;
+  if (fd_user_get(&g_db, r->user, &u) == FD_OK) { quota = fd_limit_or(u.quota, FD_DEFAULT_QUOTA); }
+  var used: int64 = 0;
+  var rc: int32 = fd_entry_usage(&g_db, r->user, &used);
+  if (rc != FD_OK) { put(b, "ERROR: Database error: "); ln(b, fd_status_text(rc)); return rc; }
+  var e: FdEntryInfo;
+  rc = fd_entry_get(&g_db, r->path, &e);
+  if (rc == FD_OK && e.kind == FD_KIND_DIR) { put(b, "ERROR: Cannot write "); ln(b, r->path); return FD_E_INVALID; }
+  if (rc == FD_OK && fd_entry_info_owner(&e) == r->user) { used = used - e.size; }
+
+  var x: FdXfer* = (FdXfer*)0;
+  var resumed: bool = false;
+  sync_mutex_lock(&g_x_lock);
+  var reserved: int64 = 0;
+  var i: int32 = 0;
+  while (i < XFER_MAX) {
+    var y: FdXfer* = &g_x[i];
+    if (y->used && y->kind == KIND_UP && x_user(y) == r->user) {
+      if (x_path(y) == r->path) {
+        if (y->pid != 0 || y->busy) {
+          sync_mutex_unlock(&g_x_lock);
+          put(b, "ERROR: An upload to ");
+          put(b, r->path);
+          ln(b, " is already in progress");
+          return FD_E_EXISTS;
+        }
+        if (r->resume && y->size == r->size && x == 0) {
+          x = y;
+          x->pid = r->pid;
+          x->busy = true;
+          x->expires = 0;
+          x->touched = time_mono_ms();
+          resumed = true;
+        } else {
+          x_free(y);   // a new upload replaces the partial one
+        }
+      } else {
+        reserved = reserved + y->size;
+      }
+    }
+    i = i + 1;
+  }
+  if (used + reserved + r->size > quota) {
+    if (x != 0) { x->busy = false; x->pid = 0; x->expires = time_mono_ms() + g_xfer_keep_ms; }
+    sync_mutex_unlock(&g_x_lock);
+    log_warn(fd_log(), "upload refused, quota", log_str("user", r->user), log_str("path", r->path),
+             log_int("size", r->size), log_int("used", used + reserved), log_int("quota", quota));
+    put(b, "ERROR: Quota exceeded: ");
+    put_int(b, r->size);
+    put(b, " bytes would bring you to ");
+    put_int(b, used + reserved + r->size);
+    put(b, " of ");
+    put_int(b, quota);
+    ln(b, "");
+    return FD_E_QUOTA;
+  }
+  if (x == 0) { x = x_new(KIND_UP, r->pid, r->user, r->path); }
+  sync_mutex_unlock(&g_x_lock);
+  if (x == 0) { ln(b, "ERROR: Server busy, try again"); return FD_E_NOMEM; }
+
+  if (resumed) {
+    rc = fd_vfs_tmp_open(&g_vfs, fd_tmp_name_str(&x->tmp), &x->fd);
+    if (rc != FD_OK) {
+      // gone, or not a regular file any more: start over
+      log_warn(fd_log(), "partial upload unusable, starting over", log_str("user", r->user),
+               log_str("path", r->path), log_str("why", fd_status_text(rc)));
+      sync_mutex_lock(&g_x_lock);
+      x_free(x);
+      x = x_new(KIND_UP, r->pid, r->user, r->path);
+      sync_mutex_unlock(&g_x_lock);
+      if (x == 0) { ln(b, "ERROR: Server busy, try again"); return FD_E_NOMEM; }
+      resumed = false;
+    }
+  }
+  if (!resumed) {
+    x->size = r->size;
+    x->off = 0;
+    cr_sha256_init(&x->sha);
+    rc = fd_vfs_tmp_create(&g_vfs, &x->tmp, &x->fd);
+    if (rc != FD_OK) {
+      log_error(fd_log(), "cannot create a temp file", log_str("error", fd_status_text(rc)));
+      x->tmp.len = 0;
+      x_drop(x);
+      ln(b, "ERROR: Cannot store the upload");
+      return rc;
+    }
+  }
+  x->lz4 = r->lz4;
+  x->quota = quota;
+  if (!x_buffers(x)) { x_drop(x); ln(b, "ERROR: Server busy, try again"); return FD_E_NOMEM; }
+  *id = x->id;
+  if (resumed) {
+    log_info(fd_log(), "upload resumed", log_str("user", r->user), log_str("path", r->path),
+             log_int("offset", x->off), log_int("size", x->size));
+  }
+  put(b, "OFFSET ");
+  put_int(b, x->off);
+  ln(b, "");
+  x_release(x);
+  return FD_OK;
+}
+
+// Discards an upload after bad input: the ERROR line (appended from `start`
+// on) is logged, then the slot and its temp file go.
+fn up_failed(x: FdXfer*, b: StrBuf*, start: int64) -> int32 {
+  log_warn(fd_log(), "upload discarded", log_str("user", x_user(x)), log_str("path", x_path(x)),
+           log_int("offset", x->off), log_str("why", since(b, start)));
+  x_drop(x);
+  return FD_E_INVALID;
+}
+
+fn up_fail(x: FdXfer*, b: StrBuf*, why: string) -> int32 {
+  var start: int64 = b->len;
+  put(b, "ERROR: ");
+  ln(b, why);
+  return up_failed(x, b, start);
+}
+
+// "ERROR: <a><n><c>" and the upload is discarded.
+fn up_fail_n(x: FdXfer*, b: StrBuf*, a: string, n: int64, c: string) -> int32 {
+  var start: int64 = b->len;
+  put(b, "ERROR: ");
+  put(b, a);
+  put_int(b, n);
+  ln(b, c);
+  return up_failed(x, b, start);
+}
+
+/// One data line of upload `id`: base64 of at most FD_CHUNK_MAX raw bytes (an
+/// LZ4 frame of them with lz4 on), a multiple of 3 unless it is the last.
+/// Written at the running offset and hashed. On bad input the upload is
+/// discarded and one ERROR line appended (the session then closes).
+/// returns: FD_OK; FD_E_INVALID (bad data); FD_E_NOT_FOUND (no such upload)
+export fn fd_xfer_up_data(id: int64, pid: int64, line: string, b: StrBuf*) -> int32 {
+  var x: FdXfer* = x_claim(id, KIND_UP, pid);
+  if (x == 0) { ln(b, "ERROR: No upload in progress"); return FD_E_NOT_FOUND; }
+  if (line.length == 0) { return up_fail(x, b, "Empty data line"); }
+  if ((int64)line.length > FD_LINE_MAX) { return up_fail(x, b, "Data line too long"); }
+  var n: int64 = 0;
+  match (base64_decode(line, (cstring)x->raw, FD_CHUNK_MAX + 64)) {
+    case Ok(d): { n = (int64)d.length; }
+    case Err(why): {
+      var start: int64 = b->len;
+      put(b, "ERROR: Bad base64 data: ");
+      ln(b, why);
+      return up_failed(x, b, start);
+    }
+  }
+  var data: uint8* = x->raw;
+  if (x->lz4) {
+    // One frame per line, and never more than FD_CHUNK_MAX bytes out of it.
+    var dec: PressLz4Dec;
+    press_lz4_dec_init(&dec);
+    press_buf_limit(&dec.win, FD_CHUNK_MAX);
+    x->pb.len = 0;
+    press_buf_limit(&x->pb, FD_CHUNK_MAX);
+    var prc: int32 = press_lz4_dec_feed(&dec, x->raw, n, &x->pb);
+    if (prc == PRESS_OK) { prc = press_lz4_dec_finish(&dec); }
+    press_lz4_dec_free(&dec);
+    if (prc != PRESS_OK) { return up_fail(x, b, "Bad compressed data line"); }
+    data = x->pb.data;
+    n = x->pb.len;
+  }
+  if (n == 0) { return up_fail(x, b, "Empty data line"); }
+  if (x->off + n > x->size) { return up_fail_n(x, b, "Data beyond SIZE (", x->size, " bytes)"); }
+  if (n % 3 != 0 && x->off + n != x->size) {
+    return up_fail_n(x, b, "Data line of ", n, " bytes is not a multiple of 3");
+  }
+  cr_sha256_update(&x->sha, data, n);
+  var done: int64 = 0;
+  while (done < n) {
+    var w: int64 = file_write_at(x->fd, data + done, n - done, x->off + done);
+    if (w <= 0) {
+      log_error(fd_log(), "upload write failed", log_str("path", x_path(x)), log_int("errno", -w));
+      return up_fail(x, b, "Cannot write the file");
+    }
+    done = done + w;
+  }
+  x->off = x->off + n;
+  x_release(x);
+  return FD_OK;
+}
+
+/// The end of upload `id`: `hex` is the client's SHA-256 of the whole file.
+/// On a match the file is synced, renamed into place and its entry written
+/// (with the hash); otherwise it is discarded. Appends the result line.
+/// returns: FD_OK; FD_E_INVALID (short, bad hash, mismatch); FD_E_QUOTA; ...
+export fn fd_xfer_up_end(id: int64, pid: int64, hex: string, b: StrBuf*) -> int32 {
+  var x: FdXfer* = x_claim(id, KIND_UP, pid);
+  if (x == 0) { ln(b, "ERROR: No upload in progress"); return FD_E_NOT_FOUND; }
+  if (x->off != x->size) { return up_fail_n(x, b, "Upload ended early, at byte ", x->off, ""); }
+  var want: uint8[32];
+  var wl: int64 = 0;
+  if (hex.length != 64 || cr_hex_decode(&want[0], 32, &wl, (uint8*)hex.chars, 64) != CR_OK || wl != 32) {
+    return up_fail(x, b, "Bad hash, expected EOF <64 hex digits>");
+  }
+  var got: CrSha256;
+  cr_sha256_final(&x->sha, &got);
+  if (!cr_equal(&got.b[0], &want[0], 32)) { return up_fail(x, b, "Hash mismatch, upload discarded"); }
+  if (file_sync(x->fd) < 0) { return up_fail(x, b, "Cannot write the file"); }
+  x_close(x);
+  var hx: uint8[65];
+  var sha: string = hex32(&got, &hx[0]);
+  var path: string = x_path(x);
+  var rc: int32 = fd_vfs_commit(&g_vfs, path, fd_tmp_name_str(&x->tmp), x->size, x_user(x), sha, x->quota);
+  if (rc != FD_OK) {
+    if (rc == FD_E_QUOTA) { ln(b, "ERROR: Quota exceeded"); }
+    else if (rc == FD_E_INVALID) { put(b, "ERROR: Cannot write "); ln(b, path); }
+    else { put(b, "ERROR: "); ln(b, fd_status_text(rc)); }
+    log_warn(fd_log(), "upload not stored", log_str("user", x_user(x)), log_str("path", path),
+             log_str("why", fd_status_text(rc)));
+    x_drop(x);
+    return rc;
+  }
+  x->tmp.len = 0;   // renamed: nothing to remove
+  log_info(fd_log(), "upload", log_str("user", x_user(x)), log_str("path", path), log_int("size", x->size),
+           log_bool("lz4", x->lz4));
+  strbuf_append_string(b, "SUCCESS: File uploaded: ");
+  var e: FdEntryInfo;
+  if (fd_entry_get(&g_db, path, &e) == FD_OK) {
+    var start: int64 = b->len;
+    fd_entry_line(b, &e);
+    // the same line as `list`, without its indent
+    memmove((rawptr)((int64)b->data + start), (rawptr)((int64)b->data + start + 2), b->len - start - 2);
+    b->len = b->len - 2;
+  } else {
+    ln(b, path);
+  }
+  x_drop(x);
+  return FD_OK;
+}
+
+// ---- downloads ----
+
+// Reads exactly n bytes at off. false on a short read or an error.
+fn read_full(fd: int64, p: uint8*, n: int64, off: int64) -> bool {
+  var got: int64 = 0;
+  while (got < n) {
+    var r: int64 = file_read_at(fd, p + got, n - got, off + got);
+    if (r <= 0) { return false; }
+    got = got + r;
+  }
+  return true;
+}
+
+/// Starts a download of `path` from byte `offset` for session `pid`. Appends
+/// `FILE_DATA: <bytes that follow>` (with ` lz4` when lz4 is on) and sets *id,
+/// or appends one ERROR line. The END_FILE hash covers the whole file: the
+/// stored one when the entry has it, else computed while reading (for an
+/// offset, over the bytes before it first).
+/// returns: FD_OK; FD_E_NOT_FOUND; FD_E_INVALID (offset past the end); ...
+export fn fd_xfer_down_begin(user: string, path: string, pid: int64, offset: int64, lz4: bool, b: StrBuf*,
+                             id: int64*) -> int32 {
+  *id = 0;
+  var fd: int64 = -1;
+  var e: FdEntryInfo;
+  var rc: int32 = fd_vfs_open_read(&g_vfs, path, &fd, &e);
+  if (rc == FD_E_NOT_FOUND || rc == FD_E_DENIED) { put(b, "ERROR: File not found: "); ln(b, path); return FD_E_NOT_FOUND; }
+  if (rc != FD_OK) { put(b, "ERROR: "); ln(b, fd_status_text(rc)); return rc; }
+  var size: int64 = file_size(fd);
+  if (size < 0) { file_close(fd); put(b, "ERROR: "); ln(b, fd_status_text(FD_E_IO)); return FD_E_IO; }
+  if (offset > size) {
+    file_close(fd);
+    put(b, "ERROR: Offset is past the end of the file (");
+    put_int(b, size);
+    ln(b, " bytes)");
+    return FD_E_INVALID;
+  }
+  sync_mutex_lock(&g_x_lock);
+  var x: FdXfer* = x_new(KIND_DOWN, pid, user, path);
+  sync_mutex_unlock(&g_x_lock);
+  if (x == 0) { file_close(fd); ln(b, "ERROR: Server busy, try again"); return FD_E_NOMEM; }
+  x->fd = fd;
+  x->size = size;
+  x->off = offset;
+  x->lz4 = lz4;
+  x->want_len = e.sha256_len;
+  memcpy((rawptr)&x->want[0], (rawptr)&e.sha256[0], (int64)e.sha256_len);
+  if (!x_buffers(x)) { x_drop(x); ln(b, "ERROR: Server busy, try again"); return FD_E_NOMEM; }
+  cr_sha256_init(&x->sha);
+  x->hashing = offset == 0 || x->want_len == 0;
+  if (offset > 0 && x->hashing) {
+    var at: int64 = 0;
+    while (at < offset) {
+      var k: int64 = offset - at;
+      if (k > FD_CHUNK_MAX) { k = FD_CHUNK_MAX; }
+      if (!read_full(fd, x->raw, k, at)) { x_drop(x); ln(b, "ERROR: Cannot read the file"); return FD_E_IO; }
+      cr_sha256_update(&x->sha, x->raw, k);
+      at = at + k;
+    }
+  }
+  *id = x->id;
+  put(b, "FILE_DATA: ");
+  put_int(b, size - offset);
+  if (lz4) { ln(b, " lz4"); } else { ln(b, ""); }
+  x_release(x);
+  return FD_OK;
+}
+
+/// The next lines of download `id`: up to DL_BATCH data lines, and after the
+/// last piece `END_FILE <sha256-hex>` and the result line (then *done). A read
+/// error ends it with an ERROR line (and *done).
+/// returns: FD_OK; FD_E_IO; FD_E_NOT_FOUND (no such download)
+export fn fd_xfer_down_read(id: int64, pid: int64, b: StrBuf*, done: bool*) -> int32 {
+  *done = false;
+  var x: FdXfer* = x_claim(id, KIND_DOWN, pid);
+  if (x == 0) { ln(b, "ERROR: No download in progress"); *done = true; return FD_E_NOT_FOUND; }
+  var piece: int64 = DL_PIECE;
+  if (x->lz4) { piece = DL_PIECE_LZ4; }
+  var k: int32 = 0;
+  while (k < DL_BATCH && x->off < x->size) {
+    var n: int64 = x->size - x->off;
+    if (n > piece) { n = piece; }
+    if (!read_full(x->fd, x->raw, n, x->off)) {
+      log_error(fd_log(), "download read failed", log_str("path", x_path(x)), log_int("offset", x->off));
+      ln(b, "ERROR: Cannot read the file");
+      x_drop(x);
+      *done = true;
+      return FD_E_IO;
+    }
+    if (x->hashing) { cr_sha256_update(&x->sha, x->raw, n); }
+    var data: uint8* = x->raw;
+    var dn: int64 = n;
+    if (x->lz4) {
+      var enc: PressLz4Enc;
+      x->pb.len = 0;
+      press_buf_limit(&x->pb, 0);
+      press_lz4_enc_init(&enc, 1);
+      var prc: int32 = press_lz4_enc_feed(&enc, x->raw, n, &x->pb);
+      if (prc == PRESS_OK) { prc = press_lz4_enc_finish(&enc, &x->pb); }
+      press_lz4_enc_free(&enc);
+      if (prc != PRESS_OK || x->pb.len > FD_CHUNK_MAX) {
+        ln(b, "ERROR: Cannot compress the file");
+        x_drop(x);
+        *done = true;
+        return FD_E_NOMEM;
+      }
+      data = x->pb.data;
+      dn = x->pb.len;
+    }
+    match (base64_encode(str_from_bytes((cstring)data, dn), (cstring)x->text, FD_LINE_MAX + 64)) {
+      case Ok(t): { ln(b, t); }
+      case Err(why): { put(b, "ERROR: "); ln(b, why); x_drop(x); *done = true; return FD_E_INVALID; }
+    }
+    x->off = x->off + n;
+    k = k + 1;
+  }
+  if (x->off < x->size) { x_release(x); return FD_OK; }
+  var hx: uint8[65];
+  var sent: string = "";
+  var bad: bool = false;
+  if (x->hashing) {
+    var got: CrSha256;
+    cr_sha256_final(&x->sha, &got);
+    sent = hex32(&got, &hx[0]);
+    if (x->want_len == 64) {
+      var stored: string = str_from_bytes((cstring)&x->want[0], 64);
+      bad = stored != sent;
+      sent = stored;   // the client checks against what was stored
+    }
+  } else {
+    sent = str_from_bytes((cstring)&x->want[0], (int64)x->want_len);
+  }
+  put(b, "END_FILE ");
+  ln(b, sent);
+  if (bad) {
+    log_error(fd_log(), "stored file does not match its hash", log_str("path", x_path(x)));
+    ln(b, "ERROR: The stored file does not match its hash");
+  } else {
+    ln(b, "SUCCESS: File sent");
+  }
+  x_drop(x);
+  *done = true;
+  return FD_OK;
+}
+
+// ---- sessions ----
+
+/// The session `pid` ended: its slots are detached (a partial upload is kept
+/// for resume). A slot a job is using is detached when the job is done.
+/// Safe from an exit hook.
+export fn fd_xfer_detach(pid: int64) {
+  if (pid == 0) { return; }
+  sync_mutex_lock(&g_x_lock);
+  var i: int32 = 0;
+  while (i < XFER_MAX) {
+    var x: FdXfer* = &g_x[i];
+    if (x->used && x->pid == pid) {
+      if (x->busy) { x->gone = true; } else { x_detach(x); }
+    }
+    i = i + 1;
+  }
+  sync_mutex_unlock(&g_x_lock);
+}
+
+/// The session `pid` is still using transfer `id` (called on its ticks).
+export fn fd_xfer_touch(id: int64, pid: int64) {
+  sync_mutex_lock(&g_x_lock);
+  var i: int32 = 0;
+  while (i < XFER_MAX) {
+    var x: FdXfer* = &g_x[i];
+    if (x->used && x->id == id) {
+      if (x->pid == pid) { x->touched = time_mono_ms(); }
+      break;
+    }
+    i = i + 1;
+  }
+  sync_mutex_unlock(&g_x_lock);
+}
+
+/// Removes partial uploads past their expiry, and detaches slots whose
+/// session stopped touching them. Run from a timer (serve.mettle).
+export fn fd_xfer_sweep() {
+  var now: int64 = time_mono_ms();
+  var orphan: int64 = 4 * fd_xfer_tick_ms() + 2000;
+  sync_mutex_lock(&g_x_lock);
+  var i: int32 = 0;
+  while (i < XFER_MAX) {
+    var x: FdXfer* = &g_x[i];
+    if (x->used && !x->busy) {
+      if (x->pid == 0 && x->expires <= now) {
+        log_info(fd_log(), "partial upload expired", log_str("user", x_user(x)), log_str("path", x_path(x)),
+                 log_int("offset", x->off));
+        x_free(x);
+      } else if (x->pid != 0 && now - x->touched > orphan) {
+        x_detach(x);
+      }
+    }
+    i = i + 1;
+  }
+  sync_mutex_unlock(&g_x_lock);
+}
+
+/// Counts for tests: transfers in use by sessions, and kept partial uploads.
+export fn fd_xfer_counts(active: int32*, partial: int32*) {
+  var a: int32 = 0;
+  var p: int32 = 0;
+  sync_mutex_lock(&g_x_lock);
+  var i: int32 = 0;
+  while (i < XFER_MAX) {
+    if (g_x[i].used) {
+      if (g_x[i].pid == 0) { p = p + 1; } else { a = a + 1; }
+    }
+    i = i + 1;
+  }
+  sync_mutex_unlock(&g_x_lock);
+  *active = a;
+  *partial = p;
+}

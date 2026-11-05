@@ -9,26 +9,26 @@
 // to the server and the reply printed up to CMD_END. With --tls the connection
 // is encrypted and the server's certificate is checked against the roots in
 // the --ca file, or the system roots without it. Local commands:
-//   status                      connection state
-//   upload <local> [remote]     read the local file, send it base64 encoded
-//   download <remote> [local]   fetch a file and write it locally
-//   quit / exit                 leave
-// A PING goes out every 5 s while idle; 12 s without PONG ends the session.
+//   status                                       connection state
+//   upload [--lz4] [--resume] <local> [remote]   stream a local file up
+//   download [--lz4] [--resume] <remote> [local] stream a file down
+//   quit / exit                                  leave
+// Transfers go a piece at a time (client/xfer.mettle) and show their progress
+// when stdout is a terminal. --lz4 compresses on the wire; --resume goes on
+// from where a broken transfer stopped. A PING goes out every 5 s while idle;
+// 12 s without PONG ends the session.
 
 import "std/io";
 import "std/mem";
 import "std/conv";
-import "std/file";
 import "std/process";
 import "std/term";
 import "std/term_os";
-import "std/encoding";
 import "std/socket";
 import "args/args";
 import "freedrs/version";
 import "freedrs/client/conn";
-
-const LOCAL_MAX: int64 = 16777216;   // the server's file size limit
+import "freedrs/client/xfer";
 
 var g_line: uint8[2048];
 var g_user: string = "";
@@ -77,12 +77,6 @@ fn split_word(s: string) -> Words {
   return w;
 }
 
-fn base_name(path: string) -> string {
-  var i: int64 = (int64)path.length - 1;
-  while (i >= 0 && path.chars[i] != '/') { i = i - 1; }
-  return str_slice(path, i + 1, (int64)path.length - i - 1);
-}
-
 // Next line from the server; false (with a message) when the connection closed.
 fn next(out: string*) -> bool {
   if (fd_conn_next_line(out)) { return true; }
@@ -90,138 +84,62 @@ fn next(out: string*) -> bool {
   return false;
 }
 
-// ---- local files ----
-
-// Reads a whole local file into a malloc'd buffer. false (message printed) on failure.
-fn read_local(path: string, out: uint8**, n: int64*) -> bool {
-  var fd: int64 = file_open(path, FILE_READ);
-  if (fd < 0) { println_err("ERROR: cannot open local file {path}"); return false; }
-  var size: int64 = file_size(fd);
-  if (size < 0 || size > LOCAL_MAX) {
-    file_close(fd);
-    println_err("ERROR: local file {path} is too large (limit {LOCAL_MAX} bytes)");
-    return false;
-  }
-  var buf: uint8* = (uint8*)malloc(size + 1);
-  if (buf == 0) { file_close(fd); println_err("ERROR: out of memory"); return false; }
-  var got: int64 = 0;
-  while (got < size) {
-    var r: int64 = file_read_at(fd, buf + got, size - got, got);
-    if (r <= 0) { break; }
-    got = got + r;
-  }
-  file_close(fd);
-  if (got != size) { free((rawptr)buf); println_err("ERROR: cannot read {path}"); return false; }
-  *out = buf;
-  *n = size;
-  return true;
-}
-
-fn write_local(path: string, data: uint8*, n: int64) -> bool {
-  var fd: int64 = file_open(path, FILE_WRITE | FILE_CREATE | FILE_TRUNCATE);
-  if (fd < 0) { return false; }
-  var off: int64 = 0;
-  while (off < n) {
-    var w: int64 = file_write_at(fd, data + off, n - off, off);
-    if (w <= 0) { file_close(fd); return false; }
-    off = off + w;
-  }
-  file_close(fd);
-  return true;
-}
-
-// ---- replies ----
-
-// Prints reply lines up to CMD_END. A FILE_DATA block is not printed; its data
-// is decoded and, when `save_as` is not empty, written there. false: connection lost.
-fn print_reply(save_as: string) -> bool {
+// Prints reply lines up to CMD_END. false: connection lost.
+fn print_reply() -> bool {
   var line: string;
-  var want_data: bool = false;
   while (true) {
     if (!next(&line)) { return false; }
     if (line == "CMD_END") { fd_conn_free_line(line); return true; }
-    if (want_data) {
-      want_data = false;
-      var cap: int64 = (int64)line.length;
-      var buf: uint8* = (uint8*)malloc(cap + 1);
-      if (buf == 0) {
-        println_err("ERROR: out of memory");
-      } else {
-        match (base64_decode(line, (cstring)buf, cap + 1)) {
-          case Ok(d): {
-            if (save_as.length == 0) { println("(received {d.length} bytes)"); }
-            else if (write_local(save_as, (uint8*)d.chars, (int64)d.length)) {
-              println("Saved {d.length} bytes to {save_as}");
-            } else {
-              println_err("ERROR: cannot write {save_as}");
-            }
-          }
-          case Err(why): { println_err("ERROR: bad file data from the server: {why}"); }
-        }
-        free((rawptr)buf);
-      }
-    } else if (line == "FILE_DATA:") {
-      want_data = true;
-    } else if (line != "END_FILE") {
-      println(line);
-    }
+    println(line);
     fd_conn_free_line(line);
   }
   return true;
 }
 
-fn do_upload(args: string, full: string) -> bool {
-  var w: Words = split_word(args);
-  if (w.word.length == 0) { println("ERROR: Usage: upload <local-file-path> [remote-path]"); return true; }
-  var data: uint8* = 0;
-  var n: int64 = 0;
-  if (!read_local(w.word, &data, &n)) { return true; }
-  var elen: int64 = 0;
-  match (base64_encoded_len(n)) {
-    case Ok(l): { elen = l; }
-    case Err(why): { free((rawptr)data); println_err("ERROR: {why}"); return true; }
+// Leading --lz4 and --resume; false (usage printed) for anything else.
+fn transfer_options(args: string, o: FdXferOpts*, rest: string*, usage: string) -> bool {
+  memset((rawptr)o, 0, (int64)sizeof(FdXferOpts));
+  o->progress = term_is_tty(1);
+  var r: string = args;
+  while (true) {
+    var w: Words = split_word(r);
+    if (str_starts_with(w.word, "--") == 0) { break; }
+    if (w.word == "--lz4") { o->lz4 = true; }
+    else if (w.word == "--resume") { o->resume = true; }
+    else { println(usage); return false; }
+    r = w.rest;
   }
-  var enc: uint8* = (uint8*)malloc(elen + 8);
-  if (enc == 0) { free((rawptr)data); println_err("ERROR: out of memory"); return true; }
-  var text: string = "";
-  match (base64_encode(str_from_bytes((cstring)data, n), (cstring)enc, elen + 1)) {
-    case Ok(t): { text = t; }
-    case Err(why): { free((rawptr)data); free((rawptr)enc); println_err("ERROR: {why}"); return true; }
-  }
-  free((rawptr)data);
-  fd_conn_busy(true);
-  var ok: bool = fd_conn_send_line(full);
-  var first: string;
-  if (ok) { ok = next(&first); }
-  if (ok) {
-    if (str_starts_with(first, "READY:") != 0) {
-      fd_conn_free_line(first);
-      // the body: one base64 line, then EOF
-      enc[(int64)text.length] = (uint8)10;
-      ok = fd_conn_send_bytes(enc, (int64)text.length + 1) && fd_conn_send_line("EOF");
-      if (ok) { ok = print_reply(""); }
-    } else {
-      // refused (usage, permission): the line is the reply, CMD_END follows
-      if (first != "CMD_END") { println(first); ok = print_reply(""); }
-      fd_conn_free_line(first);
-    }
-  }
-  free((rawptr)enc);
-  fd_conn_busy(false);
-  return ok;
+  *rest = r;
+  return true;
 }
 
-fn do_download(args: string, full: string) -> bool {
-  var w: Words = split_word(args);
-  if (w.word.length == 0) { println("ERROR: Usage: download <remote-file-path> [local-path]"); return true; }
-  var local: string = w.rest;
-  if (local.length == 0) { local = base_name(w.word); }
+fn do_upload(args: string) -> bool {
+  var usage: string = "ERROR: Usage: upload [--lz4] [--resume] <local-file-path> [remote-path]";
+  var o: FdXferOpts;
+  var rest: string = "";
+  if (!transfer_options(args, &o, &rest, usage)) { return true; }
+  var w: Words = split_word(rest);
+  if (w.word.length == 0) { println(usage); return true; }
+  var st: FdXferStats;
   fd_conn_busy(true);
-  // the server takes everything after the verb as the remote path, so send only that
-  var ok: bool = fd_conn_send_line("download {w.word}");
-  if (ok) { ok = print_reply(local); }
+  var rc: int32 = fd_client_upload(w.word, w.rest, &o, &st);
   fd_conn_busy(false);
-  return ok;
+  return rc >= 0;
+}
+
+fn do_download(args: string) -> bool {
+  var usage: string = "ERROR: Usage: download [--lz4] [--resume] <remote-file-path> [local-path]";
+  var o: FdXferOpts;
+  var rest: string = "";
+  if (!transfer_options(args, &o, &rest, usage)) { return true; }
+  var w: Words = split_word(rest);
+  if (w.word.length == 0) { println(usage); return true; }
+  var st: FdXferStats;
+  fd_conn_busy(true);
+  var rc: int32 = fd_client_download(w.word, w.rest, &o, &st);
+  fd_conn_busy(false);
+  if (rc < 0) { println_err("freedrs: connection lost; `download --resume` goes on from here"); }
+  return rc >= 0;
 }
 
 // ---- login ----
@@ -355,13 +273,13 @@ fn repl() -> int32 {
     if (verb == "status") {
       println("Connected to {g_host}:{g_port} as {g_user}");
     } else if (verb == "upload") {
-      ok = do_upload(w.rest, t);
+      ok = do_upload(w.rest);
     } else if (verb == "download") {
-      ok = do_download(w.rest, t);
+      ok = do_download(w.rest);
     } else {
       fd_conn_busy(true);
       ok = fd_conn_send_line(t);
-      if (ok) { ok = print_reply(""); }
+      if (ok) { ok = print_reply(); }
       fd_conn_busy(false);
       if (verb == "quit" || verb == "exit") { break; }
     }

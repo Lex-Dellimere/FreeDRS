@@ -9,7 +9,9 @@ import "freedrs/db/store";
 /// Seeds the default roles (admin = "*", guest = the guest verbs; roles that
 /// exist are kept) and creates the admin user with role `admin` and the given
 /// password. When the user already exists it is made admin again and its
-/// password is replaced, so the tool can be run twice.
+/// password is replaced, so the tool can be run twice. The limits: the admin
+/// role gets FD_ADMIN_MAX_FILE when it has none, and the admin user at least
+/// FD_ADMIN_QUOTA.
 ///
 /// in:      a  an initialised FdAuth over an open db; admin_user a valid name;
 ///          admin_pass 8..1024 bytes
@@ -19,18 +21,25 @@ export fn fd_setup_run(a: FdAuth*, admin_user: string, admin_pass: string) -> in
   if (!fd_name_ok(admin_user)) { return FD_E_INVALID; }
   var rc: int32 = fd_roles_seed(a->db);
   if (rc != FD_OK) { return rc; }
+  var r: FdRoleInfo;
+  rc = fd_role_get(a->db, FD_ROLE_ADMIN, &r);
+  if (rc == FD_OK && r.max_file <= 0) { rc = fd_role_set_max_file(a->db, FD_ROLE_ADMIN, FD_ADMIN_MAX_FILE); }
+  if (rc != FD_OK) { return rc; }
   var u: FdUserInfo;
   rc = fd_user_get(a->db, admin_user, &u);
   if (rc == FD_OK) {
     rc = fd_auth_set_password(a, admin_user, admin_pass);
     if (rc != FD_OK) { return rc; }
-    return fd_user_set_role(a->db, admin_user, FD_ROLE_ADMIN);
+    rc = fd_user_set_role(a->db, admin_user, FD_ROLE_ADMIN);
+    if (rc == FD_OK && u.quota < FD_ADMIN_QUOTA) { rc = fd_user_set_quota(a->db, admin_user, FD_ADMIN_QUOTA); }
+    return rc;
   }
   if (rc != FD_E_NOT_FOUND) { return rc; }
   var id: int64 = 0;
   rc = fd_user_create(a->db, admin_user, FD_ROLE_ADMIN, &id);
   if (rc != FD_OK) { return rc; }
   rc = fd_auth_set_password(a, admin_user, admin_pass);
+  if (rc == FD_OK) { rc = fd_user_set_quota(a->db, admin_user, FD_ADMIN_QUOTA); }
   if (rc != FD_OK) {
     fd_user_delete(a->db, admin_user);   // no admin without a password
     return rc;

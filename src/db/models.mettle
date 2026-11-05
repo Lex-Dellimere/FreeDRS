@@ -1,13 +1,21 @@
 // freedrs/db/models: the flux_orm models and migrations (tables on MeoDB).
 //
 //   fd_users    id, username (unique), password_hash (Argon2id text, "" = none),
-//               role (a roles.name)
-//   fd_roles    id, name (unique), commands ("*" = all, else "list,pwd,cd,..")
+//               role (a roles.name), quota (bytes the user may store)
+//   fd_roles    id, name (unique), commands ("*" = all, else "list,pwd,cd,.."),
+//               max_file (largest upload, in bytes)
 //   fd_entries  id, path (unique), kind (0 file, 1 directory), size, owner
-//               (a username), created and modified (unix seconds, std/time).
+//               (a username), created and modified (unix seconds, std/time),
+//               sha256 (lowercase hex of the file's bytes, "" when unknown).
+//
+// quota and max_file are 0 (or NULL in rows from before the column) when the
+// built-in default applies (auth/roles.mettle).
 //
 // The raize_auth tables (ra_tokens, ra_counters) are added by rfa_migration.
+// Versions 1..3 create the tables as they first were (the *V1 models below);
+// later versions add columns, so an old database and a new one end the same.
 
+import "std/mem";
 import "flux_orm/flux_orm";
 
 export const FD_KIND_FILE: int32 = 0;
@@ -24,13 +32,15 @@ export struct FdUser {
   username: string;
   password_hash: string;
   role: string;
+  quota: int64;
 }
 
-const FD_USER_COLS: RcColumn[4] = [
+const FD_USER_COLS: RcColumn[5] = [
   { index: 0, column: "id", ty: RC_T_I64, flags: RC_F_PK | RC_F_AUTO | RC_F_NOT_NULL },
   { index: 1, column: "username", ty: RC_T_TEXT, flags: RC_F_NOT_NULL | RC_F_UNIQUE },
   { index: 2, column: "password_hash", ty: RC_T_TEXT, flags: 0 },
   { index: 3, column: "role", ty: RC_T_TEXT, flags: RC_F_NOT_NULL },
+  { index: 4, column: "quota", ty: RC_T_I64, flags: 0 },
 ];
 
 var FD_USER: RcSchema;
@@ -43,7 +53,7 @@ fn fd_user_fields(s: RcSchema*) {
 
 export fn fd_user_meta() -> RcMeta {
   return rc_schema_meta(&FD_USER, &fd_user_fields, "fd_users", "FdUser", (int64)sizeof(FdUser),
-                        &FD_USER_COLS[0], 4);
+                        &FD_USER_COLS[0], 5);
 }
 
 // ---- roles ----
@@ -52,12 +62,14 @@ export struct FdRole {
   id: int64;
   name: string;
   commands: string;
+  max_file: int64;
 }
 
-const FD_ROLE_COLS: RcColumn[3] = [
+const FD_ROLE_COLS: RcColumn[4] = [
   { index: 0, column: "id", ty: RC_T_I64, flags: RC_F_PK | RC_F_AUTO | RC_F_NOT_NULL },
   { index: 1, column: "name", ty: RC_T_TEXT, flags: RC_F_NOT_NULL | RC_F_UNIQUE },
   { index: 2, column: "commands", ty: RC_T_TEXT, flags: RC_F_NOT_NULL },
+  { index: 3, column: "max_file", ty: RC_T_I64, flags: 0 },
 ];
 
 var FD_ROLE: RcSchema;
@@ -70,7 +82,7 @@ fn fd_role_fields(s: RcSchema*) {
 
 export fn fd_role_meta() -> RcMeta {
   return rc_schema_meta(&FD_ROLE, &fd_role_fields, "fd_roles", "FdRole", (int64)sizeof(FdRole),
-                        &FD_ROLE_COLS[0], 3);
+                        &FD_ROLE_COLS[0], 4);
 }
 
 // ---- file metadata entries ----
@@ -83,9 +95,10 @@ export struct FdEntry {
   owner: string;
   created: int64;
   modified: int64;
+  sha256: string;
 }
 
-const FD_ENTRY_COLS: RcColumn[7] = [
+const FD_ENTRY_COLS: RcColumn[8] = [
   { index: 0, column: "id", ty: RC_T_I64, flags: RC_F_PK | RC_F_AUTO | RC_F_NOT_NULL },
   { index: 1, column: "path", ty: RC_T_TEXT, flags: RC_F_NOT_NULL | RC_F_UNIQUE },
   { index: 2, column: "kind", ty: RC_T_I64, flags: RC_F_NOT_NULL },
@@ -93,6 +106,7 @@ const FD_ENTRY_COLS: RcColumn[7] = [
   { index: 4, column: "owner", ty: RC_T_TEXT, flags: RC_F_NOT_NULL },
   { index: 5, column: "created", ty: RC_T_I64, flags: RC_F_NOT_NULL },
   { index: 6, column: "modified", ty: RC_T_I64, flags: RC_F_NOT_NULL },
+  { index: 7, column: "sha256", ty: RC_T_TEXT, flags: 0 },
 ];
 
 var FD_ENTRY: RcSchema;
@@ -105,37 +119,117 @@ fn fd_entry_fields(s: RcSchema*) {
 
 export fn fd_entry_meta() -> RcMeta {
   return rc_schema_meta(&FD_ENTRY, &fd_entry_fields, "fd_entries", "FdEntry", (int64)sizeof(FdEntry),
+                        &FD_ENTRY_COLS[0], 8);
+}
+
+// ---- the tables as version 1..3 created them ----
+
+/// fd_users as version 1 made it.
+export struct FdUserV1 {
+  id: int64;
+  username: string;
+  password_hash: string;
+  role: string;
+}
+
+var FD_USER_V1: RcSchema;
+
+fn fd_user_v1_fields(s: RcSchema*) {
+  comptime for f in typeof(FdUserV1).fields {
+    rc_schema_field(s, f.name, f.type.kind, (int64)f.offset, (int64)f.type.size);
+  }
+}
+
+fn fd_user_v1_meta() -> RcMeta {
+  return rc_schema_meta(&FD_USER_V1, &fd_user_v1_fields, "fd_users", "FdUserV1", (int64)sizeof(FdUserV1),
+                        &FD_USER_COLS[0], 4);
+}
+
+/// fd_roles as version 2 made it.
+export struct FdRoleV1 {
+  id: int64;
+  name: string;
+  commands: string;
+}
+
+var FD_ROLE_V1: RcSchema;
+
+fn fd_role_v1_fields(s: RcSchema*) {
+  comptime for f in typeof(FdRoleV1).fields {
+    rc_schema_field(s, f.name, f.type.kind, (int64)f.offset, (int64)f.type.size);
+  }
+}
+
+fn fd_role_v1_meta() -> RcMeta {
+  return rc_schema_meta(&FD_ROLE_V1, &fd_role_v1_fields, "fd_roles", "FdRoleV1", (int64)sizeof(FdRoleV1),
+                        &FD_ROLE_COLS[0], 3);
+}
+
+/// fd_entries as version 3 made it.
+export struct FdEntryV1 {
+  id: int64;
+  path: string;
+  kind: int32;
+  size: int64;
+  owner: string;
+  created: int64;
+  modified: int64;
+}
+
+var FD_ENTRY_V1: RcSchema;
+
+fn fd_entry_v1_fields(s: RcSchema*) {
+  comptime for f in typeof(FdEntryV1).fields {
+    rc_schema_field(s, f.name, f.type.kind, (int64)f.offset, (int64)f.type.size);
+  }
+}
+
+fn fd_entry_v1_meta() -> RcMeta {
+  return rc_schema_meta(&FD_ENTRY_V1, &fd_entry_v1_fields, "fd_entries", "FdEntryV1", (int64)sizeof(FdEntryV1),
                         &FD_ENTRY_COLS[0], 7);
 }
 
 // ---- migrations ----
 
-fn fd_up_users(a: RcAdapter*) -> int32 { return rc_migration_create(a, fd_user_meta()); }
-fn fd_down_users(a: RcAdapter*) -> int32 { return rc_migration_drop(a, fd_user_meta()); }
-fn fd_up_roles(a: RcAdapter*) -> int32 { return rc_migration_create(a, fd_role_meta()); }
-fn fd_down_roles(a: RcAdapter*) -> int32 { return rc_migration_drop(a, fd_role_meta()); }
-fn fd_up_entries(a: RcAdapter*) -> int32 { return rc_migration_create(a, fd_entry_meta()); }
-fn fd_down_entries(a: RcAdapter*) -> int32 { return rc_migration_drop(a, fd_entry_meta()); }
+fn fd_up_users(a: RcAdapter*) -> int32 { return rc_migration_create(a, fd_user_v1_meta()); }
+fn fd_down_users(a: RcAdapter*) -> int32 { return rc_migration_drop(a, fd_user_v1_meta()); }
+fn fd_up_roles(a: RcAdapter*) -> int32 { return rc_migration_create(a, fd_role_v1_meta()); }
+fn fd_down_roles(a: RcAdapter*) -> int32 { return rc_migration_drop(a, fd_role_v1_meta()); }
+fn fd_up_entries(a: RcAdapter*) -> int32 { return rc_migration_create(a, fd_entry_v1_meta()); }
+fn fd_down_entries(a: RcAdapter*) -> int32 { return rc_migration_drop(a, fd_entry_v1_meta()); }
+fn fd_up_quota(a: RcAdapter*) -> int32 { return rc_migration_add_column(a, fd_user_meta(), "quota"); }
+fn fd_up_max_file(a: RcAdapter*) -> int32 { return rc_migration_add_column(a, fd_role_meta(), "max_file"); }
+fn fd_up_sha256(a: RcAdapter*) -> int32 { return rc_migration_add_column(a, fd_entry_meta(), "sha256"); }
 
-/// Fills migrations[0..3] (versions 1..3): users, roles, entries. The raize_auth
-/// tables are version 4, added by the caller with rfa_migration.
+fn fd_mig(m: RcMigration*, version: int64, name: string) {
+  memset((rawptr)m, 0, (int64)sizeof(RcMigration));
+  m->version = version;
+  m->name = name;
+  m->up_sql = "";
+  m->down_sql = "";
+}
+
+/// Number of migrations, the raize_auth one included.
+export const FD_MIGRATIONS: int32 = 7;
+
+/// Fills migrations[0..2] (versions 1..3: users, roles, entries) and
+/// migrations[4..6] (versions 5..7: the quota, max_file and sha256 columns).
+/// migrations[3] is version 4, the raize_auth tables, added by the caller with
+/// rfa_migration. The column steps have no down step.
 export fn fd_migrations(m: RcMigration*) {
-  m[0].version = 1;
-  m[0].name = "create fd_users";
-  m[0].up_sql = "";
+  fd_mig(&m[0], 1, "create fd_users");
   m[0].up = &fd_up_users;
-  m[0].down_sql = "";
   m[0].down = &fd_down_users;
-  m[1].version = 2;
-  m[1].name = "create fd_roles";
-  m[1].up_sql = "";
+  fd_mig(&m[1], 2, "create fd_roles");
   m[1].up = &fd_up_roles;
-  m[1].down_sql = "";
   m[1].down = &fd_down_roles;
-  m[2].version = 3;
-  m[2].name = "create fd_entries";
-  m[2].up_sql = "";
+  fd_mig(&m[2], 3, "create fd_entries");
   m[2].up = &fd_up_entries;
-  m[2].down_sql = "";
   m[2].down = &fd_down_entries;
+  fd_mig(&m[4], 5, "add fd_users.quota");
+  m[4].up = &fd_up_quota;
+  fd_mig(&m[5], 6, "add fd_roles.max_file");
+  m[5].up = &fd_up_max_file;
+  fd_mig(&m[6], 7, "add fd_entries.sha256");
+  m[6].up = &fd_up_sha256;
 }

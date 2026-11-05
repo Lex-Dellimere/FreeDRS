@@ -49,5 +49,6 @@ fn deps() {
   mb_dep_path("log", "../log");
   mb_dep_path("sysinfo", "../sysinfo");
   mb_dep_path("mtls", "../mtls");
+  mb_dep_path("press", "../press");
   mb_dep_bin("meodb", "meodb");
 }

@@ -26,7 +26,8 @@ fn run(addr: string) -> int32 {
   th_check("no admin yet", fd_role_get(&db, "admin", &r) == FD_E_NOT_FOUND);
   th_check("seed", fd_roles_seed(&db) == FD_OK);
   th_check("seed twice", fd_roles_seed(&db) == FD_OK);
-  th_check("admin role", fd_role_get(&db, "admin", &r) == FD_OK && fd_role_info_commands(&r) == "*");
+  th_check("admin role", fd_role_get(&db, "admin", &r) == FD_OK && fd_role_info_commands(&r) == "*"
+           && r.max_file == FD_ADMIN_MAX_FILE);
   th_check("guest role", fd_role_get(&db, "guest", &r) == FD_OK
            && fd_role_info_commands(&r) == FD_GUEST_COMMANDS);
   var roles: FdRoleInfo[8];
@@ -39,6 +40,10 @@ fn run(addr: string) -> int32 {
   th_check("create role", fd_role_set(&db, "editor", "list,upload,download") == FD_OK);
   th_check("get editor", fd_role_get(&db, "editor", &r) == FD_OK
            && fd_role_info_commands(&r) == "list,upload,download");
+  th_check("default max file", fd_role_get(&db, "editor", &r) == FD_OK && r.max_file == FD_DEFAULT_MAX_FILE);
+  th_check("set max file", fd_role_set_max_file(&db, "editor", 5000) == FD_OK
+           && fd_role_get(&db, "editor", &r) == FD_OK && r.max_file == 5000);
+  th_check("max file missing role", fd_role_set_max_file(&db, "nope", 5000) == FD_E_NOT_FOUND);
   th_check("update role", fd_role_set(&db, "editor", "list") == FD_OK);
   th_check("get updated", fd_role_get(&db, "editor", &r) == FD_OK && fd_role_info_commands(&r) == "list");
   th_check("still 3 roles", fd_role_list(&db, &roles[0], 8, &n) == FD_OK && n == 3);
@@ -70,6 +75,11 @@ fn run(addr: string) -> int32 {
   th_check("list users", fd_user_list(&db, &users[0], 8, &n) == FD_OK && n == 2);
   th_check("list order", n == 2 && fd_user_info_name(&users[0]) == "carol"
            && fd_user_info_name(&users[1]) == "bob");
+  th_check("default quota", fd_user_get(&db, "bob", &u) == FD_OK && u.quota == FD_DEFAULT_QUOTA);
+  th_check("set quota", fd_user_set_quota(&db, "bob", 1000) == FD_OK
+           && fd_user_get(&db, "bob", &u) == FD_OK && u.quota == 1000);
+  th_check("bad quota", fd_user_set_quota(&db, "bob", 0) == FD_E_INVALID);
+  th_check("quota missing user", fd_user_set_quota(&db, "nobody", 10) == FD_E_NOT_FOUND);
   th_check("delete user", fd_user_delete(&db, "bob") == FD_OK);
   th_check("delete user again", fd_user_delete(&db, "bob") == FD_E_NOT_FOUND);
 
@@ -89,6 +99,15 @@ fn run(addr: string) -> int32 {
   th_check("list docs/", fd_entry_list(&db, "docs/", &ents[0], 16, &n) == FD_OK && n == 2
            && fd_entry_info_path(&ents[0]) == "docs/a.txt");
   th_check("list owner", fd_entry_list_owner(&db, "carol", &ents[0], 16, &n) == FD_OK && n == 3);
+  var used: int64 = 0;
+  th_check("usage", fd_entry_usage(&db, "carol", &used) == FD_OK && used == 19);
+  var hex: string = "a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447";
+  th_check("add hashed", fd_entry_add_hashed(&db, "h.txt", FD_KIND_FILE, 12, "carol", hex) == FD_OK);
+  th_check("hash stored", fd_entry_get(&db, "h.txt", &ent) == FD_OK && fd_entry_info_sha256(&ent) == hex);
+  th_check("touch clears hash", fd_entry_touch(&db, "h.txt", 5, "") == FD_OK
+           && fd_entry_get(&db, "h.txt", &ent) == FD_OK && ent.size == 5 && ent.sha256_len == 0);
+  th_check("usage after", fd_entry_usage(&db, "carol", &used) == FD_OK && used == 24);
+  th_check("delete hashed", fd_entry_delete(&db, "h.txt") == FD_OK);
   th_check("delete entry", fd_entry_delete(&db, "docs/a.txt") == FD_OK);
   th_check("delete entry again", fd_entry_delete(&db, "docs/a.txt") == FD_E_NOT_FOUND);
 

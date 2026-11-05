@@ -2,14 +2,18 @@
 // (alph_offload) so session handlers never wait on meodb, Argon2id or the disk.
 //
 // A job is one function, fd_job_run, over bytes: the input is an FdJobIn header
-// followed by text; the result is an FdJobOut header followed by reply text and
-// bulk bytes. Ownership follows alph's rules: the session actor keeps its state;
-// the job gets a copy of what it needs (the FdSess, the line, the upload data)
-// and returns copies (the new FdSess, the reply). Nothing points across heaps.
+// followed by text; the result is an FdJobOut header followed by reply text.
+// Ownership follows alph's rules: the session actor keeps its state; the job
+// gets a copy of what it needs (the FdSess, the line) and returns copies (the
+// new FdSess, the reply). Nothing points across heaps; transfer state lives
+// in the xfer table and is named by its id.
 //
 //   JOB_LOGIN / JOB_SIGNUP  text = user, then password (user_len says where)
 //   JOB_CMD                 text = the command line
-//   JOB_UPLOAD              text = the collected base64 upload data
+//   JOB_UP_BEGIN            size = the SIZE of the upload in sess.up_path
+//   JOB_UP_DATA             text = one data line of upload `xfer`
+//   JOB_UP_END              text = the hex hash from the EOF line
+//   JOB_DL_READ             the next lines of download `xfer`
 //
 // Globals g_db, g_auth, g_vfs are shared by every worker (their pools and
 // locks make that safe).
@@ -24,34 +28,62 @@ import "freedrs/auth/auth";
 import "freedrs/db/store";
 import "freedrs/server/state";
 import "freedrs/server/cmds";
+import "freedrs/server/xfer";
 
 export const JOB_LOGIN: int32 = 1;
 export const JOB_SIGNUP: int32 = 2;
 export const JOB_CMD: int32 = 3;
-export const JOB_UPLOAD: int32 = 4;
+export const JOB_UP_BEGIN: int32 = 4;
+export const JOB_UP_DATA: int32 = 5;
+export const JOB_UP_END: int32 = 6;
+export const JOB_DL_READ: int32 = 7;
 
 /// Input header; `len` bytes of text follow it.
 export struct FdJobIn {
   kind: int32;
-  over: bool;        // JOB_UPLOAD: the upload was cut off (too big)
   user_len: int64;   // JOB_LOGIN / JOB_SIGNUP: bytes of user name in the text
   len: int64;
-  sess: FdSess;      // a copy of the session's state (JOB_CMD, JOB_UPLOAD)
+  size: int64;       // JOB_UP_BEGIN: the declared size
+  xfer: int64;       // JOB_UP_DATA, JOB_UP_END, JOB_DL_READ: the transfer
+  sess: FdSess;      // a copy of the session's state
 }
 
-/// Result header; `reply_len` bytes of reply text, then `bulk_len` bytes of
-/// bulk (a download's base64) follow it.
+/// Result header; `reply_len` bytes of reply text follow it.
 export struct FdJobOut {
-  rc: int32;           // JOB_LOGIN / JOB_SIGNUP: an FD_ status
+  rc: int32;           // an FD_ status
   user: FdUserInfo;    // JOB_LOGIN: the user
-  sess: FdSess;        // the session's new state (JOB_CMD, JOB_UPLOAD); bulk is not valid
+  sess: FdSess;        // the session's new state (JOB_CMD)
+  xfer: int64;         // JOB_UP_BEGIN: the new upload, 0 when refused
+  done: bool;          // JOB_DL_READ: the download is over
   reply_len: int64;
-  bulk_len: int64;
 }
 
 fn put_out(out: AlphOut*, p: rawptr, n: int64) -> bool {
   if (n <= 0) { return true; }
   return alph_out_bytes(out, p, n);
+}
+
+fn auth_job(ji: FdJobIn*, text: string, res: FdJobOut*) {
+  var user: string = str_from_bytes((cstring)text.chars, ji->user_len);
+  var pw: string = str_from_bytes((cstring)((uint8*)text.chars + ji->user_len), ji->len - ji->user_len);
+  if (ji->kind == JOB_LOGIN) {
+    res->rc = fd_auth_login(&g_auth, user, pw, &res->user);
+    if (res->rc == FD_E_DENIED || res->rc == FD_E_INVALID || res->rc == FD_E_NOT_FOUND || res->rc == FD_E_LOCKED) {
+      log_warn(fd_log(), "login failed", log_str("user", user), log_str("why", fd_status_text(res->rc)));
+    } else if (res->rc != FD_OK) {
+      log_error(fd_log(), "login error", log_str("user", user), log_str("error", fd_status_text(res->rc)));
+    }
+    return;
+  }
+  var created: FdUserInfo;
+  res->rc = fd_auth_signup(&g_auth, user, pw, &created);
+  if (res->rc == FD_OK) {
+    log_info(fd_log(), "signup", log_str("user", user));
+  } else if (res->rc == FD_E_EXISTS || res->rc == FD_E_INVALID) {
+    log_warn(fd_log(), "signup refused", log_str("user", user), log_str("why", fd_status_text(res->rc)));
+  } else {
+    log_error(fd_log(), "signup error", log_str("user", user), log_str("error", fd_status_text(res->rc)));
+  }
 }
 
 /// The work function for alph_offload. Returns 0 (the result is in `out`), or 1
@@ -63,48 +95,41 @@ export fn fd_job_run(input: rawptr, size: int64, out: AlphOut*) -> int64 {
   memset((rawptr)&res, 0, (int64)sizeof(FdJobOut));
 
   if (ji->kind == JOB_LOGIN || ji->kind == JOB_SIGNUP) {
-    var user: string = str_from_bytes((cstring)text.chars, ji->user_len);
-    var pw: string = str_from_bytes((cstring)((uint8*)text.chars + ji->user_len), ji->len - ji->user_len);
-    if (ji->kind == JOB_LOGIN) {
-      res.rc = fd_auth_login(&g_auth, user, pw, &res.user);
-      if (res.rc == FD_E_DENIED || res.rc == FD_E_INVALID || res.rc == FD_E_NOT_FOUND || res.rc == FD_E_LOCKED) {
-        log_warn(fd_log(), "login failed", log_str("user", user), log_str("why", fd_status_text(res.rc)));
-      } else if (res.rc != FD_OK) {
-        log_error(fd_log(), "login error", log_str("user", user), log_str("error", fd_status_text(res.rc)));
-      }
-    } else {
-      var created: FdUserInfo;
-      res.rc = fd_auth_signup(&g_auth, user, pw, &created);
-      if (res.rc == FD_OK) {
-        log_info(fd_log(), "signup", log_str("user", user));
-      } else if (res.rc == FD_E_EXISTS || res.rc == FD_E_INVALID) {
-        log_warn(fd_log(), "signup refused", log_str("user", user), log_str("why", fd_status_text(res.rc)));
-      } else {
-        log_error(fd_log(), "signup error", log_str("user", user), log_str("error", fd_status_text(res.rc)));
-      }
-    }
+    auth_job(ji, text, &res);
     if (!put_out(out, (rawptr)&res, (int64)sizeof(FdJobOut))) { return 1; }
     return 0;
   }
 
-  var a: Arena* = arena_init(65536);
+  var chunk: int64 = 16384;
+  if (ji->kind == JOB_CMD) { chunk = 65536; }
+  if (ji->kind == JOB_DL_READ) { chunk = 1048576; }
+  var a: Arena* = arena_init(chunk);
   if (a == 0) { return 1; }
-  var b: StrBuf* = strbuf_new(a, 1024);
+  var b: StrBuf* = strbuf_new(a, chunk - 1024);
   memcpy((rawptr)&res.sess, (rawptr)&ji->sess, (int64)sizeof(FdSess));
-  if (ji->kind == JOB_UPLOAD) {
-    fd_cmd_upload_finish(&res.sess, text, ji->over, b, a);
-    res.sess.action = FD_ACT_NONE;
-  } else {
-    fd_cmd_run(&res.sess, text, b, a);
+  var s: FdSess* = &res.sess;
+  if (ji->kind == JOB_CMD) {
+    fd_cmd_run(s, text, b, a);
+  } else if (ji->kind == JOB_UP_BEGIN) {
+    var r: FdUpReq;
+    r.user = fd_user_info_name(&s->user);
+    r.role = fd_user_info_role(&s->user);
+    r.path = fd_vpath_str(&s->up_path);
+    r.pid = s->pid;
+    r.size = ji->size;
+    r.lz4 = s->up_lz4;
+    r.resume = s->up_resume;
+    res.rc = fd_xfer_up_begin(&r, b, &res.xfer);
+  } else if (ji->kind == JOB_UP_DATA) {
+    res.rc = fd_xfer_up_data(ji->xfer, s->pid, text, b);
+  } else if (ji->kind == JOB_UP_END) {
+    res.rc = fd_xfer_up_end(ji->xfer, s->pid, text, b);
+  } else if (ji->kind == JOB_DL_READ) {
+    res.rc = fd_xfer_down_read(ji->xfer, s->pid, b, &res.done);
   }
   res.reply_len = b->len;
-  var bulk: uint8* = res.sess.bulk;
-  if (res.sess.action == FD_ACT_BULK) { res.bulk_len = res.sess.bulk_len; }
-  res.sess.bulk = 0;
-  res.sess.bulk_len = 0;
   var ok: bool = put_out(out, (rawptr)&res, (int64)sizeof(FdJobOut));
   if (ok) { ok = put_out(out, (rawptr)b->data, b->len); }
-  if (ok && res.bulk_len > 0) { ok = put_out(out, (rawptr)bulk, res.bulk_len); }
   arena_free(a);
   if (!ok) { return 1; }
   return 0;

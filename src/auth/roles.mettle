@@ -15,6 +15,20 @@ export const FD_ADMIN_COMMANDS: string = "*";
 /// Verbs of the guest role (also the fallback for an unknown role).
 export const FD_GUEST_COMMANDS: string = "list,pwd,cd,help,whoami,quit,exit";
 
+/// Largest upload for a role whose max_file is not set (0), in bytes: 4 GiB.
+export const FD_DEFAULT_MAX_FILE: int64 = 4294967296;
+/// Bytes a user may store when the user's quota is not set (0): 10 GiB.
+export const FD_DEFAULT_QUOTA: int64 = 10737418240;
+/// What setup gives the admin role and the admin user: 1 TiB each.
+export const FD_ADMIN_MAX_FILE: int64 = 1099511627776;
+export const FD_ADMIN_QUOTA: int64 = 1099511627776;
+
+/// The limit that applies: the stored value, or `def` when it is not set.
+export fn fd_limit_or(value: int64, def: int64) -> int64 {
+  if (value > 0) { return value; }
+  return def;
+}
+
 /// Longest user or role name, in bytes.
 export const FD_NAME_MAX: int32 = 64;
 /// Longest comma-separated verb list stored for a role, in bytes.

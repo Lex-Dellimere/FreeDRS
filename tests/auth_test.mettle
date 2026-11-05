@@ -99,6 +99,7 @@ fn run(addr: string) -> int32 {
   th_check("setup", fd_setup_run(&a, "admin", "admin password") == FD_OK);
   th_check("admin login", fd_auth_login(&a, "admin", "admin password", &u) == FD_OK);
   th_check("admin role", fd_user_info_role(&u) == "admin");
+  th_check("admin quota", u.quota == FD_ADMIN_QUOTA);
   th_check("admin can anything", fd_can(&db, &u, "kick") && fd_can(&db, &u, "upload"));
   th_check("setup again replaces password", fd_setup_run(&a, "admin", "second password") == FD_OK);
   th_check("old admin password denied", fd_auth_login(&a, "admin", "admin password", &u) == FD_E_DENIED);

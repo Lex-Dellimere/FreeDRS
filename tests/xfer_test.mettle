@@ -1,0 +1,634 @@
+// tests/xfer_test: streaming uploads and downloads against the real server
+// (alph sessions, worker pool, embedded meodb) on an OS-chosen port, with the
+// client library (client/conn.mettle, client/xfer.mettle). Over TCP: a 300 MiB
+// round trip, a hash mismatch, limits refused before any data (role max file
+// size, user quota), bad lines (base64, data beyond SIZE, not a multiple of 3,
+// overlong, bad SIZE), LZ4 both ways and an LZ4 bomb, a stalled upload that
+// times out and is resumed, links planted at the temp paths and at targets,
+// a slow reader that must not grow the server's memory, partial upload
+// expiry, and no file descriptor or temp file left behind. Then the 300 MiB
+// round trip again over TLS. Data is generated under .mbuild/xfer.
+// A test program: `mbuild test xfer`.
+
+import "std/io";
+import "std/mem";
+import "std/conv";
+import "std/time";
+import "std/arena";
+import "std/strbuf";
+import "std/file";
+import "std/fs";
+import "std/encoding";
+import "crypto/crypto";
+import "press/press";
+import "harness";
+import "freedrs/status";
+import "freedrs/auth/auth";
+import "freedrs/db/store";
+import "freedrs/vfs/vfs";
+import "freedrs/setup/setup";
+import "freedrs/server/state";
+import "freedrs/server/serve";
+import "freedrs/server/session";
+import "freedrs/server/tls";
+import "freedrs/server/xfer";
+import "freedrs/client/conn";
+import "freedrs/client/xfer";
+
+const DIR: string = ".mbuild/xfer";
+const ROOT: string = ".mbuild/xfer/root";
+const BIG: string = ".mbuild/xfer/big.bin";
+const BIG_SIZE: int64 = 314572800;   // 300 MiB
+
+var g_port: int32 = 0;
+
+fn has(s: string, needle: string) -> bool {
+  return str_contains(s, needle) != 0;
+}
+
+// ---- files ----
+
+const LINE_TEXT: string = "FreeDRS streaming transfer test, the same words over and over.\n";
+
+// size bytes from a xorshift generator; compressible: the same line of text
+// again and again, with a random letter now and then.
+fn gen_file(path: string, size: int64, seed: uint64, compressible: bool) -> bool {
+  var fd: int64 = file_open(path, FILE_WRITE | FILE_CREATE | FILE_TRUNCATE);
+  if (fd < 0) { return false; }
+  var cap: int64 = 4194304;
+  var buf: uint8* = (uint8*)malloc(cap);
+  var x: uint64 = seed;
+  var off: int64 = 0;
+  var ok: bool = buf != 0;
+  while (ok && off < size) {
+    var n: int64 = size - off;
+    if (n > cap) { n = cap; }
+    var i: int64 = 0;
+    while (i < n) {
+      x = x ^ (x << 13);
+      x = x ^ (x >> 7);
+      x = x ^ (x << 17);
+      if (compressible) {
+        buf[i] = (uint8)LINE_TEXT.chars[(off + i) % 64];
+        if ((off + i) % 1000 == 0) { buf[i] = (uint8)(97 + (int64)(x % 26)); }
+      } else {
+        buf[i] = (uint8)(x & 255);
+      }
+      i = i + 1;
+    }
+    ok = file_write_at(fd, buf, n, off) == n;
+    off = off + n;
+  }
+  if (buf != 0) { free((rawptr)buf); }
+  file_close(fd);
+  return ok;
+}
+
+fn write_text(path: string, text: string) -> bool {
+  var fd: int64 = file_open(path, FILE_WRITE | FILE_CREATE | FILE_TRUNCATE);
+  if (fd < 0) { return false; }
+  var ok: bool = file_write_at(fd, (uint8*)text.chars, (int64)text.length, 0) == (int64)text.length;
+  file_close(fd);
+  return ok;
+}
+
+fn read_text(path: string, buf: uint8*, cap: int64) -> string {
+  var fd: int64 = file_open(path, FILE_READ);
+  if (fd < 0) { return ""; }
+  var n: int64 = file_read_at(fd, buf, cap, 0);
+  file_close(fd);
+  if (n < 0) { n = 0; }
+  return str_from_bytes((cstring)buf, n);
+}
+
+// SHA-256 of a file as hex into out (65 bytes); "" when it cannot be read.
+fn file_sha(path: string, out: uint8*) -> string {
+  var fd: int64 = file_open(path, FILE_READ);
+  if (fd < 0) { return ""; }
+  var buf: uint8* = (uint8*)malloc(1048576);
+  var st: CrSha256State;
+  cr_sha256_init(&st);
+  var off: int64 = 0;
+  while (true) {
+    var n: int64 = file_read_at(fd, buf, 1048576, off);
+    if (n <= 0) { break; }
+    cr_sha256_update(&st, buf, n);
+    off = off + n;
+  }
+  free((rawptr)buf);
+  file_close(fd);
+  var d: CrSha256;
+  cr_sha256_final(&st, &d);
+  var hl: int64 = 0;
+  cr_hex_encode(out, 65, &hl, &d.b[0], 32);
+  return str_from_bytes((cstring)out, 64);
+}
+
+// Open descriptors of this process on files under .mbuild/xfer.
+fn fd_count() -> int32 {
+  var d: FsDir* = (FsDir*)malloc((int64)sizeof(FsDir));
+  if (fs_dir_open("/proc/self/fd", d) != 0) { free((rawptr)d); return -1; }
+  var n: int32 = 0;
+  var e: FsDirEntry;
+  var target: uint8[1024];
+  while (fs_dir_next(d, &e) > 0) {
+    if (e.name == "." || e.name == "..") { continue; }
+    var l: int64 = fs_readlink("/proc/self/fd/{e.name}", &target[0], 1024);
+    if (l > 0 && str_contains(str_from_bytes((cstring)&target[0], l), "/.mbuild/xfer/") != 0) { n = n + 1; }
+  }
+  fs_dir_close(d);
+  free((rawptr)d);
+  return n;
+}
+
+// The one temp file's name (or "") into buf.
+fn tmp_name(buf: uint8*) -> string {
+  var d: FsDir* = (FsDir*)malloc((int64)sizeof(FsDir));
+  var name: string = "";
+  if (fs_dir_open("{ROOT}/.freedrs-tmp", d) == 0) {
+    var e: FsDirEntry;
+    while (fs_dir_next(d, &e) > 0) {
+      if (str_starts_with(e.name, ".up-") != 0) {
+        memcpy((rawptr)buf, (rawptr)e.name.chars, (int64)e.name.length);
+        name = str_from_bytes((cstring)buf, (int64)e.name.length);
+      }
+    }
+    fs_dir_close(d);
+  }
+  free((rawptr)d);
+  return name;
+}
+
+// ---- protocol ----
+
+fn reply(a: Arena*) -> string {
+  var b: StrBuf* = strbuf_new(a, 256);
+  var line: string;
+  while (fd_conn_next_line(&line)) {
+    if (line == "CMD_END") { fd_conn_free_line(line); break; }
+    strbuf_append_string(b, line);
+    strbuf_append_byte(b, (uint8)10);
+    fd_conn_free_line(line);
+  }
+  return strbuf_finish_string(b);
+}
+
+fn cmd(a: Arena*, line: string) -> string {
+  fd_conn_send_line(line);
+  return reply(a);
+}
+
+fn next_is(want: string) -> bool {
+  var line: string;
+  if (!fd_conn_next_line(&line)) { return false; }
+  var ok: bool = line == want;
+  if (!ok) { println("  got: {line}"); }
+  fd_conn_free_line(line);
+  return ok;
+}
+
+fn connect_login(user: string, pass: string) -> bool {
+  var msg: string = "";
+  if (!fd_conn_open("127.0.0.1", g_port, false, &msg)) { println("  connect: {msg}"); return false; }
+  var line: string;
+  if (!fd_conn_next_line(&line) || !fd_conn_next_line(&line)) { return false; }
+  fd_conn_send_line("login {user} {pass}");
+  if (!fd_conn_next_line(&line) || str_starts_with(line, "SUCCESS") == 0) { return false; }
+  return fd_conn_next_line(&line);
+}
+
+// upload up to OFFSET 0 for `size` bytes.
+fn begin_upload(target: string, size: int64, lz4: bool) -> bool {
+  if (lz4) {
+    fd_conn_send_line("upload --lz4 x {target}");
+    if (!next_is("READY: 65536 lz4")) { return false; }
+  } else {
+    fd_conn_send_line("upload x {target}");
+    if (!next_is("READY: 65536")) { return false; }
+  }
+  fd_conn_send_line("SIZE {size}");
+  return next_is("OFFSET 0");
+}
+
+// Sends n bytes of the file at off as one data line.
+fn send_piece(fd: int64, off: int64, n: int64) -> bool {
+  var raw: uint8* = (uint8*)malloc(n + 1);
+  var text: uint8* = (uint8*)malloc(n * 2 + 16);
+  var ok: bool = file_read_at(fd, raw, n, off) == n;
+  if (ok) {
+    match (base64_encode(str_from_bytes((cstring)raw, n), (cstring)text, n * 2 + 16)) {
+      case Ok(t): { ok = fd_conn_send_line(t); }
+      case Err(why): { ok = false; }
+    }
+  }
+  free((rawptr)raw);
+  free((rawptr)text);
+  return ok;
+}
+
+// The reply of a refused line, and the server closing the session after it.
+fn refused_and_closed(a: Arena*, want: string) -> bool {
+  var r: string = reply(a);
+  var ok: bool = has(r, want);
+  if (!ok) { println("  got: {r}"); }
+  var line: string;
+  var closed: bool = !fd_conn_next_line(&line);
+  fd_conn_close();
+  return ok && closed;
+}
+
+// Waits up to ms for the server to settle: no transfers in use, `partial`
+// kept partial uploads.
+fn wait_counts(partial: int32, ms: int64) -> bool {
+  var until: int64 = time_mono_ms() + ms;
+  while (true) {
+    var act: int32 = 0;
+    var part: int32 = 0;
+    fd_xfer_counts(&act, &part);
+    if (act == 0 && part == partial) { return true; }
+    if (time_mono_ms() > until) { println("  transfers: {act} active, {part} partial"); return false; }
+    time_sleep_ms(20);
+  }
+  return false;
+}
+
+fn quiet() -> FdXferOpts {
+  var o: FdXferOpts;
+  memset((rawptr)&o, 0, (int64)sizeof(FdXferOpts));
+  o.quiet = true;
+  return o;
+}
+
+// ---- the parts ----
+
+// Upload BIG, download it again, compare. Over whatever the client is set to.
+fn round_trip(what: string, big_sha: string) {
+  var o: FdXferOpts = quiet();
+  var st: FdXferStats;
+  var t0: int64 = time_mono_ms();
+  var rc: int32 = fd_client_upload(BIG, "big.bin", &o, &st);
+  var t1: int64 = time_mono_ms();
+  th_check("{what} upload", rc == 0 && st.bytes == BIG_SIZE && has(fd_xfer_stats_last(&st), "SUCCESS: File uploaded: big.bin"));
+  var e: FdEntryInfo;
+  th_check("{what} stored hash", fd_entry_get(&g_db, "big.bin", &e) == FD_OK && fd_entry_info_sha256(&e) == big_sha
+           && e.size == BIG_SIZE);
+  fs_remove("{DIR}/big.out");
+  fd_session_peaks_reset();
+  rc = fd_client_download("big.bin", "{DIR}/big.out", &o, &st);
+  var t2: int64 = time_mono_ms();
+  var hx: uint8[65];
+  th_check("{what} download", rc == 0 && st.bytes == BIG_SIZE && file_sha("{DIR}/big.out", &hx[0]) == big_sha);
+  th_check("{what} no part file left", !fs_exists("{DIR}/big.out.freedrs-part"));
+  var peak_out: int64 = 0;
+  var peak_heap: int64 = 0;
+  fd_session_peaks(&peak_out, &peak_heap);
+  th_check("{what} download memory bounded", peak_out > 0 && peak_out < 4194304 && peak_heap < 16777216);
+  println("  {what}: 300 MiB up {t1 - t0} ms, down {t2 - t1} ms; peak output {peak_out / 1024} KiB, session heap {peak_heap / 1024} KiB");
+  fs_remove("{DIR}/big.out");
+}
+
+fn bad_lines(a: Arena*) {
+  // a hash that does not match: refused, nothing stored, the session goes on
+  th_check("mismatch login", connect_login("admin", "admin password"));
+  th_check("mismatch begin", begin_upload("mm.txt", 6, false));
+  fd_conn_send_line("aGVsbG8h");
+  fd_conn_send_line("EOF 0000000000000000000000000000000000000000000000000000000000000000");
+  th_check("mismatch refused", has(reply(a), "ERROR: Hash mismatch"));
+  var e: FdEntryInfo;
+  th_check("mismatch not stored", fd_entry_get(&g_db, "mm.txt", &e) == FD_E_NOT_FOUND && !fs_exists("{ROOT}/mm.txt"));
+  th_check("mismatch temp removed", fd_vfs_tmp_count(&g_vfs) == 0);
+  th_check("bad hash begin", begin_upload("mm.txt", 6, false));
+  fd_conn_send_line("aGVsbG8h");
+  fd_conn_send_line("EOF xyz");
+  th_check("bad hash refused", has(reply(a), "ERROR: Bad hash"));
+  th_check("session goes on", has(cmd(a, "whoami"), "(admin)"));
+  fd_conn_close();
+
+  th_check("base64 login", connect_login("admin", "admin password"));
+  th_check("base64 begin", begin_upload("b.txt", 6, false));
+  fd_conn_send_line("aGVsbG8*");
+  th_check("bad base64 refused", refused_and_closed(a, "ERROR: Bad base64 data"));
+
+  th_check("beyond login", connect_login("admin", "admin password"));
+  th_check("beyond begin", begin_upload("b.txt", 3, false));
+  fd_conn_send_line("aGVsbG8h");
+  th_check("data beyond SIZE refused", refused_and_closed(a, "ERROR: Data beyond SIZE"));
+
+  th_check("three login", connect_login("admin", "admin password"));
+  th_check("three begin", begin_upload("b.txt", 10, false));
+  fd_conn_send_line("aGVsbA==");
+  th_check("not a multiple of 3 refused", refused_and_closed(a, "is not a multiple of 3"));
+
+  var b: StrBuf* = strbuf_new(a, 140001);
+  var i: int32 = 0;
+  while (i < 35000) { strbuf_append_string(b, "AAAA"); i = i + 1; }
+  var long: string = strbuf_finish_string(b);
+  th_check("long login", connect_login("admin", "admin password"));
+  th_check("long begin", begin_upload("b.txt", 200000, false));
+  fd_conn_send_line(str_slice(long, 0, 90000));
+  th_check("long data line refused", refused_and_closed(a, "ERROR: Data line too long"));
+  th_check("overlong login", connect_login("admin", "admin password"));
+  th_check("overlong begin", begin_upload("b.txt", 200000, false));
+  fd_conn_send_line(long);
+  th_check("overlong line refused", refused_and_closed(a, "ERROR: Line too long"));
+
+  th_check("size login", connect_login("admin", "admin password"));
+  fd_conn_send_line("upload x b.txt");
+  th_check("size ready", next_is("READY: 65536"));
+  fd_conn_send_line("SIZE -5");
+  th_check("bad SIZE refused", refused_and_closed(a, "ERROR: Bad SIZE"));
+  th_check("size2 login", connect_login("admin", "admin password"));
+  fd_conn_send_line("upload x b.txt");
+  th_check("size2 ready", next_is("READY: 65536"));
+  fd_conn_send_line("aGVsbG8h");
+  th_check("missing SIZE refused", refused_and_closed(a, "ERROR: Expected SIZE"));
+
+  th_check("bad lines leave nothing", wait_counts(0, 3000) && fd_vfs_tmp_count(&g_vfs) == 0);
+  th_check("bad lines store nothing", fd_entry_get(&g_db, "b.txt", &e) == FD_E_NOT_FOUND);
+}
+
+fn limits(a: Arena*) {
+  th_check("limits admin", connect_login("admin", "admin password"));
+  th_check("createrole", has(cmd(a, "createrole uploader list,upload,download,whoami,quit,exit"), "SUCCESS"));
+  th_check("setmaxfile", has(cmd(a, "setmaxfile uploader 1000"), "SUCCESS"));
+  var u: FdUserInfo;
+  th_check("bob", fd_auth_signup(&g_auth, "bob", "bob password", &u) == FD_OK);
+  th_check("bob role", fd_user_set_role(&g_db, "bob", "uploader") == FD_OK);
+  th_check("setquota", has(cmd(a, "setquota bob 1500"), "SUCCESS: Quota updated for bob"));
+  th_check("setquota bad", has(cmd(a, "setquota bob -1"), "ERROR: Usage"));
+  fd_conn_close();
+
+  th_check("bob login", connect_login("bob", "bob password"));
+  fd_conn_send_line("upload x big1.txt");
+  th_check("oversize ready", next_is("READY: 65536"));
+  fd_conn_send_line("SIZE 2000");
+  th_check("oversize refused before data", has(reply(a), "ERROR: File too large: 2000 bytes (your limit is 1000)"));
+  th_check("bob goes on", has(cmd(a, "whoami"), "(bob)"));
+  th_check("small file", gen_file("{DIR}/900.bin", 900, 7, false));
+  var o: FdXferOpts = quiet();
+  var st: FdXferStats;
+  th_check("within quota", fd_client_upload("{DIR}/900.bin", "a.bin", &o, &st) == 0);
+  th_check("quota refused before data", fd_client_upload("{DIR}/900.bin", "b.bin", &o, &st) == 1
+           && has(fd_xfer_stats_last(&st), "ERROR: Quota exceeded") && st.bytes == 0);
+  th_check("replace own file within quota", fd_client_upload("{DIR}/900.bin", "a.bin", &o, &st) == 0);
+  fd_conn_close();
+  th_check("limits leave nothing", wait_counts(0, 3000) && fd_vfs_tmp_count(&g_vfs) == 0);
+}
+
+fn lz4(a: Arena*) {
+  var path: string = "{DIR}/text.bin";
+  th_check("lz4 file", gen_file(path, 25165824, 99, true));
+  var hx: uint8[65];
+  var want: string = file_sha(path, &hx[0]);
+  th_check("lz4 login", connect_login("admin", "admin password"));
+  var o: FdXferOpts = quiet();
+  o.lz4 = true;
+  var st: FdXferStats;
+  th_check("lz4 upload", fd_client_upload(path, "text.bin", &o, &st) == 0 && st.lz4 && st.bytes == 25165824);
+  th_check("lz4 upload compressed", st.wire < st.bytes / 2);
+  fs_remove("{DIR}/text.out");
+  th_check("lz4 download", fd_client_download("text.bin", "{DIR}/text.out", &o, &st) == 0 && st.lz4
+           && st.wire < st.bytes / 2);
+  var hy: uint8[65];
+  th_check("lz4 round trip", file_sha("{DIR}/text.out", &hy[0]) == want);
+  // incompressible data still fits a line per piece
+  th_check("lz4 random", gen_file("{DIR}/rnd.bin", 1000000, 5, false));
+  th_check("lz4 random upload", fd_client_upload("{DIR}/rnd.bin", "rnd.bin", &o, &st) == 0);
+  fs_remove("{DIR}/rnd.out");
+  th_check("lz4 random download", fd_client_download("rnd.bin", "{DIR}/rnd.out", &o, &st) == 0
+           && file_sha("{DIR}/rnd.out", &hy[0]) == file_sha("{DIR}/rnd.bin", &hx[0]));
+  fd_conn_close();
+
+  // one line that inflates to 1 MiB: refused, never written
+  th_check("bomb login", connect_login("admin", "admin password"));
+  th_check("bomb begin", begin_upload("bomb.bin", 1048576, true));
+  var zeros: uint8* = (uint8*)calloc(1, 1048576);
+  var pb: PressBuf;
+  memset((rawptr)&pb, 0, (int64)sizeof(PressBuf));
+  th_check("bomb made", press_lz4_compress(zeros, 1048576, 1, &pb) == PRESS_OK && pb.len < 65536);
+  var text: uint8* = (uint8*)malloc(100000);
+  match (base64_encode(str_from_bytes((cstring)pb.data, pb.len), (cstring)text, 100000)) {
+    case Ok(t): { fd_conn_send_line(t); }
+    case Err(why): { th_check("bomb encode", false); }
+  }
+  th_check("lz4 bomb refused", refused_and_closed(a, "ERROR: Bad compressed data line"));
+  free((rawptr)text);
+  free((rawptr)zeros);
+  press_buf_free(&pb);
+  th_check("lz4 leaves nothing", wait_counts(0, 3000) && fd_vfs_tmp_count(&g_vfs) == 0);
+}
+
+// Starts an upload of `path` to `target`, sends `lines` pieces, then stops
+// sending until the server gives up on it.
+fn stall_upload(a: Arena*, path: string, target: string, size: int64, lines: int32) -> bool {
+  if (!connect_login("admin", "admin password")) { return false; }
+  if (!begin_upload(target, size, false)) { return false; }
+  var fd: int64 = file_open(path, FILE_READ);
+  var i: int32 = 0;
+  var ok: bool = fd >= 0;
+  while (ok && i < lines) { ok = send_piece(fd, (int64)i * 65535, 65535); i = i + 1; }
+  if (fd >= 0) { file_close(fd); }
+  var t0: int64 = time_mono_ms();
+  ok = ok && refused_and_closed(a, "ERROR: Transfer timed out");
+  var waited: int64 = time_mono_ms() - t0;
+  return ok && waited >= 1000;
+}
+
+fn resume(a: Arena*) {
+  var path: string = "{DIR}/res.bin";
+  th_check("resume file", gen_file(path, 4194304, 3, false));
+  th_check("stalled upload times out", stall_upload(a, path, "res.bin", 4194304, 10));
+  th_check("partial kept", wait_counts(1, 3000) && fd_vfs_tmp_count(&g_vfs) == 1);
+  th_check("resume login", connect_login("admin", "admin password"));
+  var o: FdXferOpts = quiet();
+  o.resume = true;
+  var st: FdXferStats;
+  th_check("resumed upload", fd_client_upload(path, "res.bin", &o, &st) == 0 && st.offset == 655350
+           && st.bytes == 4194304 - 655350);
+  fs_remove("{DIR}/res.out");
+  o.resume = false;
+  var hx: uint8[65];
+  var hy: uint8[65];
+  th_check("resumed file intact", fd_client_download("res.bin", "{DIR}/res.out", &o, &st) == 0
+           && file_sha("{DIR}/res.out", &hx[0]) == file_sha(path, &hy[0]));
+
+  // a download cut off, then resumed from its part file
+  var part: string = "{DIR}/res2.out.freedrs-part";
+  var fd: int64 = file_open(part, FILE_WRITE | FILE_CREATE | FILE_TRUNCATE);
+  var src: int64 = file_open(path, FILE_READ);
+  var buf: uint8* = (uint8*)malloc(1000000);
+  th_check("part file", fd >= 0 && src >= 0 && file_read_at(src, buf, 1000000, 0) == 1000000
+           && file_write_at(fd, buf, 1000000, 0) == 1000000);
+  free((rawptr)buf);
+  file_close(fd);
+  file_close(src);
+  o.resume = true;
+  th_check("resumed download", fd_client_download("res.bin", "{DIR}/res2.out", &o, &st) == 0 && st.offset == 1000000
+           && file_sha("{DIR}/res2.out", &hx[0]) == file_sha(path, &hy[0]));
+  fd_conn_close();
+  th_check("resume leaves nothing", wait_counts(0, 3000) && fd_vfs_tmp_count(&g_vfs) == 0);
+}
+
+fn links(a: Arena*) {
+  var victim: string = "{DIR}/victim.txt";
+  th_check("victim", write_text(victim, "precious"));
+  var path: string = "{DIR}/res.bin";
+  var vbuf: uint8[64];
+
+  // a link put in place of a kept partial upload is not followed on resume
+  th_check("link partial", stall_upload(a, path, "lnk.bin", 4194304, 2));
+  th_check("link partial kept", wait_counts(1, 3000));
+  var nb: uint8[64];
+  var name: string = tmp_name(&nb[0]);
+  th_check("temp name", name.length == 36);
+  var tpath: string = "{ROOT}/.freedrs-tmp/{name}";
+  th_check("plant link at temp file", fs_remove(tpath) == 0 && fs_symlink("../../victim.txt", tpath) == 0);
+  th_check("link login", connect_login("admin", "admin password"));
+  var o: FdXferOpts = quiet();
+  o.resume = true;
+  var st: FdXferStats;
+  th_check("resume past a link starts over", fd_client_upload(path, "lnk.bin", &o, &st) == 0 && st.offset == 0);
+  th_check("victim untouched (temp file)", read_text(victim, &vbuf[0], 64) == "precious");
+
+  // a link in place of the temp directory is replaced by a real one
+  var outside: string = "{DIR}/outside";
+  fs_remove_all(outside);
+  th_check("outside dir", fs_mkdir(outside, 0x1ED) == 0);
+  th_check("plant link at temp dir", fs_remove_all("{ROOT}/.freedrs-tmp") == 0
+           && fs_symlink("../outside", "{ROOT}/.freedrs-tmp") == 0);
+  o.resume = false;
+  th_check("upload past a temp dir link", fd_client_upload(victim, "v1.txt", &o, &st) == 0);
+  var fs: FsStat;
+  th_check("temp dir is real again", fs_lstat("{ROOT}/.freedrs-tmp", &fs) == 0 && fs.kind == FS_DIR);
+  var d: FsDir;
+  var e: FsDirEntry;
+  var n: int32 = 0;
+  if (fs_dir_open(outside, &d) == 0) {
+    while (fs_dir_next(&d, &e) > 0) { if (e.name != "." && e.name != "..") { n = n + 1; } }
+    fs_dir_close(&d);
+  }
+  th_check("nothing written outside", n == 0);
+
+  // a link at the target is replaced, not written through
+  th_check("plant link at target", fs_symlink("../victim.txt", "{ROOT}/link.txt") == 0);
+  th_check("write file over the link", write_text("{DIR}/other.txt", "other"));
+  th_check("upload over a link", fd_client_upload("{DIR}/other.txt", "link.txt", &o, &st) == 0);
+  th_check("target is a file now", fs_lstat("{ROOT}/link.txt", &fs) == 0 && fs.kind == FS_FILE);
+  th_check("victim untouched (target)", read_text(victim, &vbuf[0], 64) == "precious");
+
+  // a stored file swapped for a link is not served
+  th_check("swap file for link", fs_remove("{ROOT}/link.txt") == 0 && fs_symlink("../victim.txt", "{ROOT}/link.txt") == 0);
+  fs_remove("{DIR}/link.out");
+  th_check("download of a link refused", fd_client_download("link.txt", "{DIR}/link.out", &o, &st) == 1
+           && has(fd_xfer_stats_last(&st), "ERROR: File not found") && !fs_exists("{DIR}/link.out"));
+  th_check("reserved temp name", has(cmd(a, "download .freedrs-tmp/x"), "ERROR: Invalid path"));
+  fd_conn_close();
+  th_check("links leave nothing", wait_counts(0, 3000) && fd_vfs_tmp_count(&g_vfs) == 0);
+}
+
+// A reader that stops reading: the server must stop producing.
+fn slow_reader(a: Arena*) {
+  th_check("slow login", connect_login("admin", "admin password"));
+  fd_session_peaks_reset();
+  fd_conn_send_line("download big.bin");
+  th_check("slow FILE_DATA", next_is("FILE_DATA: {BIG_SIZE}"));
+  time_sleep_ms(1000);   // read nothing: the socket and the client queue fill
+  var out0: int64 = 0;
+  var heap0: int64 = 0;
+  fd_session_peaks(&out0, &heap0);
+  // then read slowly for a while
+  var line: string;
+  var got: int32 = 0;
+  var ok: bool = true;
+  while (got < 300 && ok) {
+    ok = fd_conn_next_line(&line) && (int64)line.length == 87380;
+    if (ok) { fd_conn_free_line(line); }
+    if (got % 20 == 0) { time_sleep_ms(10); }
+    got = got + 1;
+  }
+  th_check("slow lines arrive", ok);
+  var out1: int64 = 0;
+  var heap1: int64 = 0;
+  fd_session_peaks(&out1, &heap1);
+  println("  slow reader: peak output {out1 / 1024} KiB, session heap {heap1 / 1024} KiB");
+  th_check("slow reader output bounded", out0 > 0 && out1 < 4194304);
+  th_check("slow reader heap bounded", heap1 < 16777216);
+  fd_conn_close();   // abort in the middle
+  th_check("aborted download freed", wait_counts(0, 3000));
+}
+
+fn expiry(a: Arena*) {
+  var keep: int64 = g_xfer_keep_ms;
+  g_xfer_keep_ms = 300;
+  th_check("expiry partial", stall_upload(a, "{DIR}/res.bin", "exp.bin", 4194304, 3));
+  th_check("partial expires", wait_counts(0, 3000) && fd_vfs_tmp_count(&g_vfs) == 0);
+  g_xfer_keep_ms = keep;
+}
+
+fn run(addr: string) -> int32 {
+  th_check("db open", fd_db_open(&g_db, addr, "") == FD_OK);
+  fd_roles_seed(&g_db);
+  th_check("auth init", fd_auth_init(&g_auth, &g_db) == FD_OK);
+  th_check("setup admin", fd_setup_run(&g_auth, "admin", "admin password") == FD_OK);
+  fs_remove_all(DIR);
+  th_check("data dir", fs_mkdir_all(ROOT, 0x1ED) == 0);
+  th_check("vfs init", fd_vfs_init(&g_vfs, &g_db, ROOT) == FD_OK);
+  g_xfer_stall_ms = 1500;
+  g_xfer_sweep_ms = 100;
+  var port: int64 = 0;
+  var msg: string = "";
+  th_check("server start", fd_server_start(0, &port, &msg) && port > 0);
+  if (port <= 0) { return 1; }
+  g_port = (int32)port;
+  var a: Arena* = arena_init(65536);
+
+  var t0: int64 = time_mono_ms();
+  th_check("big file", gen_file(BIG, BIG_SIZE, 88172645463325252, false));
+  var hx: uint8[65];
+  var big_sha: string = file_sha(BIG, &hx[0]);
+  println("  made 300 MiB of data in {time_mono_ms() - t0} ms");
+
+  th_check("tcp login", connect_login("admin", "admin password"));
+  round_trip("tcp", big_sha);
+  fd_conn_close();
+  th_check("tcp round trip leaves nothing", wait_counts(0, 3000) && fd_vfs_tmp_count(&g_vfs) == 0);
+  var fds: int32 = 0;
+
+  bad_lines(a);
+  limits(a);
+  lz4(a);
+  resume(a);
+  links(a);
+  slow_reader(a);
+  expiry(a);
+
+  // every session above has ended: no descriptor is left open
+  var until: int64 = time_mono_ms() + 3000;
+  var now_fds: int32 = fd_count();
+  while (now_fds > fds && time_mono_ms() < until) { time_sleep_ms(50); now_fds = fd_count(); }
+  th_check("no descriptors leaked ({fds} before, {now_fds} after)", now_fds <= fds);
+
+  // the same round trip over TLS
+  th_check("tls enable", fd_tls_enable("tests/data/tls_cert.pem", "tests/data/tls_key.pem") == 0);
+  th_check("tls client", fd_conn_use_tls("tests/data/tls_cert.pem", &msg));
+  th_check("tls login", connect_login("admin", "admin password"));
+  round_trip("tls", big_sha);
+  fd_conn_close();
+  th_check("tls round trip leaves nothing", wait_counts(0, 3000) && fd_vfs_tmp_count(&g_vfs) == 0);
+
+  arena_free(a);
+  fs_remove(BIG);   // 300 MiB is not worth keeping between runs
+  return 0;
+}
+
+fn main() -> int32 {
+  var addr: string = th_start(".mbuild/test_xfer.meo");
+  if (addr.length == 0) { return 1; }
+  run(addr);
+  if (th_failures() > 0) {
+    println("FAIL xfer_test: {th_failures()} checks failed");
+    return 1;   // the server thread and meodb die with the process
+  }
+  println("PASS xfer_test");
+  return 0;
+}

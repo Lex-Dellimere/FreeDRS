@@ -5,8 +5,9 @@
 // login, mkdir, upload, list, download, a path traversal, serverinfo, a guest
 // refused, quit. Then the same server over TLS (tests/data/tls_cert.pem is a
 // self-signed test certificate for localhost and 127.0.0.1, with its key): a
-// login and a 120 KB upload and download, and a client that does not trust the
-// certificate. A test program: `mbuild test e2e`.
+// login and a 120 KB upload and download (client/xfer.mettle), and a client
+// that does not trust the certificate. A test program: `mbuild test e2e`.
+// The streaming transfers in depth are in xfer_test.mettle.
 
 import "std/io";
 import "std/mem";
@@ -14,6 +15,7 @@ import "std/conv";
 import "std/arena";
 import "std/strbuf";
 import "std/socket";
+import "std/file";
 import "harness";
 import "freedrs/status";
 import "freedrs/config/config";
@@ -25,6 +27,7 @@ import "freedrs/server/state";
 import "freedrs/server/serve";
 import "freedrs/server/tls";
 import "freedrs/client/conn";
+import "freedrs/client/xfer";
 
 // Reads reply lines up to CMD_END into one string (lines joined by \n).
 fn reply(a: Arena*) -> string {
@@ -77,11 +80,13 @@ fn run(addr: string) -> int32 {
   th_check("mkdir", has(cmd(a, "mkdir docs"), "SUCCESS: Directory created: docs"));
   th_check("cd", has(cmd(a, "cd docs"), "Changed directory to: /docs"));
 
-  // upload "hello world\n" (aGVsbG8gd29ybGQK) to docs/x.txt, as the client does it
+  // upload "hello world\n" (aGVsbG8gd29ybGQK) to docs/x.txt, line by line
   fd_conn_send_line("upload local.txt x.txt");
-  th_check("ready", fd_conn_next_line(&line) && has(line, "READY:"));
+  th_check("ready", fd_conn_next_line(&line) && line == "READY: 65536");
+  fd_conn_send_line("SIZE 12");
+  th_check("offset", fd_conn_next_line(&line) && line == "OFFSET 0");
   fd_conn_send_line("aGVsbG8gd29ybGQK");
-  fd_conn_send_line("EOF");
+  fd_conn_send_line("EOF {HELLO_SHA}");
   var up: string = reply(a);
   th_check("uploaded", has(up, "SUCCESS: File uploaded: docs/x.txt [file] 12B - admin"));
 
@@ -90,7 +95,10 @@ fn run(addr: string) -> int32 {
   th_check("myfiles", has(cmd(a, "myfiles"), "docs/x.txt"));
 
   var dl: string = cmd(a, "download x.txt");
-  th_check("download data", has(dl, "FILE_DATA:\naGVsbG8gd29ybGQK\nEND_FILE\nSUCCESS: File sent"));
+  th_check("download data", has(dl, "FILE_DATA: 12\naGVsbG8gd29ybGQK\nEND_FILE {HELLO_SHA}\nSUCCESS: File sent"));
+  var dl2: string = cmd(a, "download x.txt 6");
+  th_check("download offset", has(dl2, "FILE_DATA: 6\nd29ybGQK\nEND_FILE {HELLO_SHA}\nSUCCESS: File sent"));
+  th_check("download past end", has(cmd(a, "download x.txt 13"), "ERROR: Offset is past the end"));
   th_check("download missing", has(cmd(a, "download nope.txt"), "ERROR: File not found: docs/nope.txt"));
   th_check("traversal", has(cmd(a, "download ../../etc/passwd"), "ERROR: Path traversal not allowed"));
   th_check("ping", has(cmd(a, "ping"), "PONG"));
@@ -119,12 +127,37 @@ fn run(addr: string) -> int32 {
   return 0;
 }
 
-// 120000 bytes of "ABC" as base64: one long line.
-fn big_payload(a: Arena*) -> string {
-  var b: StrBuf* = strbuf_new(a, 200000);
-  var i: int32 = 0;
-  while (i < 40000) { strbuf_append_string(b, "QUJD"); i = i + 1; }
-  return strbuf_finish_string(b);
+const HELLO_SHA: string = "a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447";
+
+// A local file of 120000 bytes of "ABC".
+fn big_file(path: string) -> bool {
+  var fd: int64 = file_open(path, FILE_WRITE | FILE_CREATE | FILE_TRUNCATE);
+  if (fd < 0) { return false; }
+  var i: int64 = 0;
+  var ok: bool = true;
+  while (i < 40000 && ok) { ok = file_write_at(fd, (uint8*)"ABC".chars, 3, i * 3) == 3; i = i + 1; }
+  file_close(fd);
+  return ok;
+}
+
+fn same_file(p: string, q: string) -> bool {
+  var a: int64 = file_open(p, FILE_READ);
+  var b: int64 = file_open(q, FILE_READ);
+  var same: bool = a >= 0 && b >= 0 && file_size(a) == file_size(b);
+  var x: uint8[4096];
+  var y: uint8[4096];
+  var off: int64 = 0;
+  while (same) {
+    var n: int64 = file_read_at(a, &x[0], 4096, off);
+    var m: int64 = file_read_at(b, &y[0], 4096, off);
+    if (n != m || n < 0) { same = false; break; }
+    if (n == 0) { break; }
+    same = memcmp((rawptr)&x[0], (rawptr)&y[0], n) == 0;
+    off = off + n;
+  }
+  if (a >= 0) { file_close(a); }
+  if (b >= 0) { file_close(b); }
+  return same;
 }
 
 // The server serves TLS from here on (the plain script is done). The client is
@@ -148,14 +181,15 @@ fn run_tls(a: Arena*, port: int64) -> int32 {
   th_check("tls help prompt", fd_conn_next_line(&line) && has(line, "'help'"));
   th_check("tls whoami", has(cmd(a, "whoami"), "(admin)"));
 
-  var data: string = big_payload(a);
-  fd_conn_send_line("upload big.bin");
-  th_check("tls ready", fd_conn_next_line(&line) && has(line, "READY:"));
-  fd_conn_send_line(data);
-  fd_conn_send_line("EOF");
-  th_check("tls uploaded", has(reply(a), "SUCCESS: File uploaded: big.bin [file] 120000B"));
-  var dl: string = cmd(a, "download big.bin");
-  th_check("tls download", has(dl, "FILE_DATA:\n{data}\nEND_FILE\nSUCCESS: File sent"));
+  th_check("tls big file", big_file(".mbuild/e2e_big.bin"));
+  var o: FdXferOpts;
+  memset((rawptr)&o, 0, (int64)sizeof(FdXferOpts));
+  o.quiet = true;
+  var st: FdXferStats;
+  th_check("tls upload", fd_client_upload(".mbuild/e2e_big.bin", "big.bin", &o, &st) == 0
+           && has(fd_xfer_stats_last(&st), "SUCCESS: File uploaded: big.bin [file] 120000B"));
+  th_check("tls download", fd_client_download("big.bin", ".mbuild/e2e_big.out", &o, &st) == 0
+           && st.bytes == 120000 && same_file(".mbuild/e2e_big.bin", ".mbuild/e2e_big.out"));
   th_check("tls delete", has(cmd(a, "delete big.bin"), "SUCCESS: File deleted"));
   th_check("tls quit", has(cmd(a, "quit"), "Goodbye!"));
   fd_conn_close();

@@ -13,6 +13,8 @@
 //             up even when a session crashes. The supervisor is linked to the
 //             acceptor and stops every session when the acceptor ends.
 //   session   one per client (session.mettle).
+// The acceptor also runs the transfer sweep (xfer.mettle) on a timer:
+// expired partial uploads go, and slots no live session uses are detached.
 // The pattern is alph's examples/echo.mettle (acceptor + dynamic supervisor +
 // connection actors with IO handles).
 
@@ -23,8 +25,15 @@ import "log/log";
 import "freedrs/db/store";
 import "freedrs/server/state";
 import "freedrs/server/session";
+import "freedrs/server/xfer";
 
 const REASON_LISTEN: int64 = ALPH_REASON_USER;
+const TAG_SWEEP: int64 = ALPH_TAG_USER;
+const TAG_SIGNAL: int64 = ALPH_TAG_USER + 1;
+/// A write to a socket the client has closed raises SIGPIPE, which would end
+/// the process; the node takes it over and the boss drops it, so the write
+/// just fails with EPIPE and that session ends.
+const SIGPIPE: int64 = 13;
 const START_TIMEOUT_MS: int64 = 1000;
 
 var g_node: AlphNode;
@@ -72,6 +81,12 @@ fn acceptor(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
     a->sup = alph_spawn_dyn(ctx, &spec);
     alph_io_arm(ctx, a->listener, ALPH_IO_IN);
     alph_atomic_store_sc(&g_port, alph_tcp_port(ctx, a->listener));
+    alph_send_after(ctx, g_xfer_sweep_ms, ctx->self, TAG_SWEEP, 0);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == TAG_SWEEP) {
+    fd_xfer_sweep();
+    alph_send_after(ctx, g_xfer_sweep_ms, ctx->self, TAG_SWEEP, 0);
     return ALPH_CONTINUE;
   }
   if (m->tag == ALPH_TAG_IO && m->ref == a->listener) {
@@ -133,6 +148,7 @@ fn boss(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
     if (m->from == 0) { return alph_stop(ctx, m->arg); }   // the node is shutting down
     if (m->arg != ALPH_NORMAL) { alph_shutdown(ctx, 1000, 1); }
   }
+  // TAG_SIGNAL: only SIGPIPE is taken over, and it needs nothing
   return ALPH_CONTINUE;
 }
 
@@ -143,10 +159,13 @@ fn boss(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
 export fn fd_server_start(port: int64, bound: int64*, msg: string*) -> bool {
   var cfg: AlphConfig;
   alph_config(&cfg);
+  cfg.signals = (int64)1 << SIGPIPE;
   if (!alph_node_start(&g_node, &cfg)) { *msg = "cannot start the alph node"; return false; }
   var b: Boss;
   b.port = port;
-  if (alph_node_spawn_value<Boss>(&g_node, 0, &b, &boss) == 0) { *msg = "cannot start the server actor"; return false; }
+  var pid: int64 = alph_node_spawn_value<Boss>(&g_node, 0, &b, &boss);
+  if (pid == 0) { *msg = "cannot start the server actor"; return false; }
+  alph_node_signals(&g_node, pid, TAG_SIGNAL);
   // The acceptor publishes the port (or -1) from its first handler call.
   while (alph_atomic_load(&g_port) == 0) { thread_sleep_ms(2); }
   if (alph_atomic_load(&g_port) < 0) {

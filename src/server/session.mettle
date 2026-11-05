@@ -7,9 +7,20 @@
 // peer close, ends; the runtime closes the handle when the actor exits.
 //
 // States:
-//   AUTH    greeting; `login`, `signup` or `guest`; no CMD_END.
-//   CMD     one line in, reply lines and CMD_END out (cmds.mettle).
-//   UPLOAD  after `upload`: base64 lines until a line `EOF`, then the reply.
+//   AUTH      greeting; `login`, `signup` or `guest`; no CMD_END.
+//   CMD       one line in, reply lines and CMD_END out (cmds.mettle).
+//   UP_SIZE   after `upload` and READY: the `SIZE <n>` line.
+//   UP_DATA   after OFFSET: base64 data lines, one job each, until `EOF <hash>`.
+//   DOWNLOAD  after FILE_DATA: the session asks the pool for the next lines
+//             only once its output (and mtls's) is below DL_LOW, so a slow
+//             reader holds the server to a few MB. Input waits until it ends.
+//
+// While a transfer runs the session ticks (alph_send_after): no progress for
+// g_xfer_stall_ms ends the session. A protocol error in a transfer (a bad
+// line, data beyond SIZE) gets an ERROR line and CMD_END, then the session
+// closes. The exit hook detaches the session's transfers (xfer.mettle), so a
+// session that ends any way leaves no open file or temp file behind, except a
+// partial upload kept for resume.
 //
 // `kick` sends the target session actor a TAG_KICK message (state.mettle keeps
 // the pid); it ends itself. `shutdown` asks the node to stop in order.
@@ -25,13 +36,15 @@
 // VFS file IO) and the end of an upload run as jobs on alph's worker pool
 // (jobs.mettle, alph_offload): the session sends a copy of what the job needs,
 // stops running lines while the job is out (st->job), and applies the answer
-// (ALPH_TAG_DONE: the new FdSess and the reply text) when it arrives. Collecting
-// upload lines and queueing output stay in the actor.
+// (ALPH_TAG_DONE: the new FdSess and the reply text) when it arrives. Each
+// upload data line and each batch of download lines is one job too.
 
 import "std/mem";
 import "std/conv";
 import "std/arena";
 import "std/strbuf";
+import "std/sync";
+import "std/time";
 import "alph/alph";
 import "log/log";
 import "mtls/mtls";
@@ -41,16 +54,23 @@ import "freedrs/db/store";
 import "freedrs/server/state";
 import "freedrs/server/cmds";
 import "freedrs/server/jobs";
+import "freedrs/server/xfer";
 
 const MODE_AUTH: int32 = 0;
 const MODE_CMD: int32 = 1;
-const MODE_UPLOAD: int32 = 2;
+const MODE_UP_SIZE: int32 = 2;
+const MODE_UP_DATA: int32 = 3;
+const MODE_DOWNLOAD: int32 = 4;
 
 const RBUF_START: int64 = 65536;
-/// Longest line accepted (a base64 upload is one line), in bytes.
-const LINE_MAX: int64 = 25165824;
-/// Base64 text accepted for one upload; more is dropped and reported.
-const UPLOAD_MAX: int64 = 22369700;
+/// Longest line accepted, in bytes (a data line is at most FD_LINE_MAX).
+const LINE_MAX: int64 = 131072;
+/// A download asks for more lines once less than this waits to be sent.
+const DL_LOW: int64 = 1048576;
+/// The answers to `upload`: the most raw bytes a data line may carry
+/// (FD_CHUNK_MAX), and whether LZ4 is on.
+const READY: string = "READY: 65536\n";
+const READY_LZ4: string = "READY: 65536 lz4\n";
 
 /// How long a job may take before the session answers with an error.
 const JOB_TIMEOUT_MS: int64 = 120000;
@@ -76,10 +96,11 @@ struct FdSession {
   rcap: int64;
   rstart: int64;
   rscan: int64;
-  up: uint8*;
-  up_len: int64;
-  up_cap: int64;
-  up_over: bool;
+  xfer: int64;         // the transfer in progress, or 0
+  x_last: int64;       // mono ms of its last progress
+  x_left: int64;       // output waiting at the last settle (download progress)
+  tick_gen: int64;     // the tick that counts; older ones are dropped
+  ticking: bool;
   tls: MtlsNb;
   tls_on: bool;        // tls is started (the exit hook closes it)
   tls_ready: bool;     // the handshake is done and the greeting queued
@@ -88,12 +109,36 @@ struct FdSession {
 
 // ---- output ----
 
-const OUT_LIMIT: int64 = 33554432;   // a 16 MiB file is 22.4 MB of base64
+const OUT_LIMIT: int64 = 8388608;
 /// Message to a session: end it (kick).
 export const TAG_KICK: int64 = ALPH_TAG_USER;
 /// Message a session sends itself: read again (TLS keeps decrypted bytes that
 /// the socket will not announce).
 const TAG_MORE: int64 = ALPH_TAG_USER + 1;
+/// Message a session sends itself during a transfer: check for a stall.
+const TAG_TICK: int64 = ALPH_TAG_USER + 2;
+
+// The most output (outq plus mtls) and heap a downloading session has held,
+// for the tests.
+var g_peak_lock: SyncMutex;
+var g_peak_out: int64 = 0;
+var g_peak_heap: int64 = 0;
+
+/// The most output bytes waiting, and heap bytes, any downloading session has
+/// held since the last reset.
+export fn fd_session_peaks(out: int64*, heap: int64*) {
+  sync_mutex_lock(&g_peak_lock);
+  *out = g_peak_out;
+  *heap = g_peak_heap;
+  sync_mutex_unlock(&g_peak_lock);
+}
+
+export fn fd_session_peaks_reset() {
+  sync_mutex_lock(&g_peak_lock);
+  g_peak_out = 0;
+  g_peak_heap = 0;
+  sync_mutex_unlock(&g_peak_lock);
+}
 
 /// With TLS, output goes from the queue into mtls in pieces of this size, and
 /// only while mtls holds less than TLS_QUEUE unsent bytes (mtls limits its own
@@ -129,6 +174,22 @@ fn out_buf(st: FdSession*, b: StrBuf*) {
   out_put(st, (rawptr)b->data, b->len);
 }
 
+// Output waiting to be sent: the queue, and with TLS what mtls holds.
+fn out_waiting(st: FdSession*) -> int64 {
+  var n: int64 = alph_outq_pending(&st->out);
+  if (st->tls_on) { n = n + mtls_nb_pending(&st->tls); }
+  return n;
+}
+
+fn note_peak(st: FdSession*) {
+  var o: int64 = out_waiting(st);
+  var h: int64 = alph_heap_used(st->ctx);
+  sync_mutex_lock(&g_peak_lock);
+  if (o > g_peak_out) { g_peak_out = o; }
+  if (h > g_peak_heap) { g_peak_heap = h; }
+  sync_mutex_unlock(&g_peak_lock);
+}
+
 // ---- input ----
 
 // Next complete line (without \n or \r) into *out, valid until the buffer is
@@ -160,9 +221,10 @@ fn make_room(st: FdSession*) -> bool {
     st->rscan = rest;
     st->rstart = 0;
   }
+  if (st->rlen > LINE_MAX) { return false; }   // no newline in all of it
   if (st->rcap - st->rlen < 4096) {
     var cap: int64 = st->rcap * 2;
-    if (cap > LINE_MAX + RBUF_START) { cap = LINE_MAX + RBUF_START; }
+    if (cap > LINE_MAX + 8192) { cap = LINE_MAX + 8192; }
     if (cap <= st->rcap) { return false; }
     var p: rawptr = alph_realloc(st->ctx, (rawptr)st->rbuf, cap);
     if (p == 0) { return false; }
@@ -246,30 +308,33 @@ fn db_error(st: FdSession*, rc: int32) {
   out_str(st, "\n");
 }
 
+// A job could not run. In a transfer that ends the session (the client and
+// the server no longer agree where the data stands).
 fn busy_error(st: FdSession*, kind: int32, why: string) {
   log_warn(fd_log(), "server busy", log_int("session", st->ctx->self), log_int("client", st->sess.client_id),
            log_int("job", kind), log_str("why", why));
   if (kind == JOB_LOGIN || kind == JOB_SIGNUP) {
     out_str(st, "ERROR: Server busy, try again\n");
-  } else {
-    out_str(st, "ERROR: Server busy, try again\nCMD_END\n");
+    return;
+  }
+  out_str(st, "ERROR: Server busy, try again\nCMD_END\n");
+  if (st->mode != MODE_CMD) {
+    st->why = "transfer failed";
+    st->closing = true;
+    st->mode = MODE_CMD;
   }
 }
 
 // Sends a job (header + text) to the worker pool. The session then waits for
 // the answer (st->job); no more lines are run until it comes.
-// `text` may be 0 for a header-only job. For JOB_UPLOAD the header is built in
-// place in the upload buffer (see handle_upload_line), passed as `ji`.
-fn submit(st: FdSession*, ji: FdJobIn*, text: rawptr, text_len: int64, whole: bool) {
+// `text` may be 0 for a header-only job.
+fn submit(st: FdSession*, ji: FdJobIn*, text: rawptr, text_len: int64) {
   var hdr: int64 = (int64)sizeof(FdJobIn);
-  var block: rawptr = (rawptr)ji;
   var total: int64 = hdr + text_len;
-  if (!whole) {
-    block = alph_scratch(st->ctx, total);
-    if (block == 0) { busy_error(st, ji->kind, "no memory"); return; }
-    memcpy(block, (rawptr)ji, hdr);
-    if (text_len > 0) { memcpy((rawptr)((uint8*)block + hdr), text, text_len); }
-  }
+  var block: rawptr = alph_scratch(st->ctx, total);
+  if (block == 0) { busy_error(st, ji->kind, "no memory"); return; }
+  memcpy(block, (rawptr)ji, hdr);
+  if (text_len > 0) { memcpy((rawptr)((uint8*)block + hdr), text, text_len); }
   var ref: int64 = alph_offload(st->ctx, st->pool, block, total, JOB_TIMEOUT_MS, &fd_job_run);
   if (ref <= 0) { busy_error(st, ji->kind, "job not queued"); return; }   // pool full or no memory
   st->job = ref;
@@ -310,7 +375,7 @@ fn handle_auth(st: FdSession*, line: string) {
   ji.kind = kind;
   ji.user_len = un;
   ji.len = un + pn;
-  submit(st, &ji, buf, un + pn, false);
+  submit(st, &ji, buf, un + pn);
 }
 
 // The answer to a login or signup job.
@@ -358,49 +423,157 @@ fn run_command(st: FdSession*, line: string) {
   ji.kind = JOB_CMD;
   ji.len = (int64)line.length;
   memcpy((rawptr)&ji.sess, (rawptr)&st->sess, (int64)sizeof(FdSess));
-  submit(st, &ji, (rawptr)line.chars, (int64)line.length, false);
+  submit(st, &ji, (rawptr)line.chars, (int64)line.length);
 }
 
-// Starts the end of an upload on the pool. The collected data already sits
-// behind a header-sized gap in st->up, so it is sent from there without
-// another copy; the buffer is freed once the job is on its way.
-fn finish_upload(st: FdSession*) {
-  if (st->up == 0) {   // an empty upload: the header alone
-    st->up = (uint8*)alph_alloc(st->ctx, up_hdr());
-    if (st->up == 0) { busy_error(st, JOB_UPLOAD, "no memory"); return; }
-    st->up_cap = up_hdr();
+// ---- transfers ----
+
+// Starts the stall check for the transfer that just began.
+fn start_ticks(st: FdSession*) {
+  st->x_last = time_mono_ms();
+  if (st->ticking) { return; }
+  st->ticking = true;
+  st->tick_gen = st->tick_gen + 1;
+  alph_send_after(st->ctx, fd_xfer_tick_ms(), st->ctx->self, TAG_TICK, st->tick_gen);
+}
+
+// A transfer job for the transfer in progress (header only, or one line).
+fn submit_xfer(st: FdSession*, kind: int32, size: int64, text: string) {
+  var ji: FdJobIn;
+  memset((rawptr)&ji, 0, (int64)sizeof(FdJobIn));
+  ji.kind = kind;
+  ji.len = (int64)text.length;
+  ji.size = size;
+  ji.xfer = st->xfer;
+  memcpy((rawptr)&ji.sess, (rawptr)&st->sess, (int64)sizeof(FdSess));
+  submit(st, &ji, (rawptr)text.chars, (int64)text.length);
+}
+
+// A broken transfer protocol: the error, CMD_END, and the session closes.
+fn violation(st: FdSession*, why: string) {
+  log_warn(fd_log(), "transfer protocol error", log_int("session", st->ctx->self),
+           log_int("client", st->sess.client_id), log_str("error", why));
+  out_str(st, "ERROR: ");
+  out_str(st, why);
+  out_str(st, "\nCMD_END\n");
+  st->why = "protocol error";
+  st->closing = true;
+  st->mode = MODE_CMD;
+}
+
+// The line after READY: `SIZE <bytes>`.
+fn handle_size(st: FdSession*, line: string) {
+  if (str_starts_with(line, "SIZE ") == 0) { violation(st, "Expected SIZE <bytes>"); return; }
+  var n: int64 = fd_parse_count(str_slice(line, 5, (int64)line.length - 5));
+  if (n < 0) { violation(st, "Bad SIZE"); return; }
+  st->x_last = time_mono_ms();
+  submit_xfer(st, JOB_UP_BEGIN, n, "");
+}
+
+// A data line, or `EOF <sha256-hex>`.
+fn handle_data(st: FdSession*, line: string) {
+  st->x_last = time_mono_ms();
+  if (str_starts_with(line, "EOF") != 0) {
+    var hex: string = "";
+    if ((int64)line.length > 4 && line.chars[3] == ' ') { hex = str_slice(line, 4, (int64)line.length - 4); }
+    submit_xfer(st, JOB_UP_END, 0, hex);
+    return;
   }
-  var ji: FdJobIn* = (FdJobIn*)st->up;
-  memset((rawptr)ji, 0, up_hdr());
-  ji->kind = JOB_UPLOAD;
-  ji->over = st->up_over;
-  ji->len = st->up_len;
-  memcpy((rawptr)&ji->sess, (rawptr)&st->sess, (int64)sizeof(FdSess));
-  submit(st, ji, 0, st->up_len, true);
-  alph_free(st->ctx, (rawptr)st->up);
-  st->up = 0;
-  st->up_cap = 0;
-  st->up_len = 0;
+  submit_xfer(st, JOB_UP_DATA, 0, line);
 }
 
-// The answer to a command or upload job: the reply, then what the command asked for.
+// The answer to a transfer job.
+fn xfer_done(st: FdSession*, kind: int32, o: FdJobOut*, size: int64) {
+  var hdr: int64 = (int64)sizeof(FdJobOut);
+  if (size < hdr + o->reply_len) { busy_error(st, kind, "short result"); return; }
+  var reply: uint8* = (uint8*)o + hdr;
+  st->x_last = time_mono_ms();
+  if (kind == JOB_UP_BEGIN) {
+    out_put(st, (rawptr)reply, o->reply_len);
+    if (o->xfer == 0) { out_str(st, "CMD_END\n"); st->mode = MODE_CMD; return; }
+    st->xfer = o->xfer;
+    st->mode = MODE_UP_DATA;
+    return;
+  }
+  if (kind == JOB_UP_DATA) {
+    if (o->rc == FD_OK) { return; }
+    out_put(st, (rawptr)reply, o->reply_len);   // the upload was discarded
+    out_str(st, "CMD_END\n");
+    st->xfer = 0;
+    st->mode = MODE_CMD;
+    st->why = "bad upload data";
+    st->closing = true;
+    return;
+  }
+  if (kind == JOB_UP_END) {
+    out_put(st, (rawptr)reply, o->reply_len);
+    out_str(st, "CMD_END\n");
+    st->xfer = 0;
+    st->mode = MODE_CMD;
+    return;
+  }
+  // JOB_DL_READ
+  out_put(st, (rawptr)reply, o->reply_len);
+  note_peak(st);
+  if (o->done) {
+    out_str(st, "CMD_END\n");
+    st->xfer = 0;
+    st->mode = MODE_CMD;
+  }
+}
+
+// With a download running and its output drained below DL_LOW, asks for the
+// next lines.
+fn download_more(st: FdSession*) {
+  if (st->mode != MODE_DOWNLOAD || st->job != 0 || st->closing || st->broken) { return; }
+  if (out_waiting(st) >= DL_LOW) { return; }
+  submit_xfer(st, JOB_DL_READ, 0, "");
+}
+
+// No progress for too long: the error goes out if the socket takes it, and
+// the session ends (its exit hook detaches the transfer).
+fn stalled(st: FdSession*) -> int64 {
+  log_warn(fd_log(), "transfer stalled", log_int("session", st->ctx->self), log_int("client", st->sess.client_id),
+           log_str("user", fd_user_info_name(&st->sess.user)), log_int("mode", st->mode));
+  out_str(st, "ERROR: Transfer timed out\nCMD_END\n");
+  if (st->tls_on) { tls_feed(st); mtls_nb_pump(&st->tls); }
+  else { alph_outq_flush(st->ctx, &st->out, st->h); }
+  st->why = "transfer timed out";
+  return end_session(st->ctx, st);
+}
+
+// The stall check, every fd_xfer_tick_ms while a transfer runs.
+fn on_tick(st: FdSession*, gen: int64) -> int64 {
+  if (gen != st->tick_gen) { return ALPH_CONTINUE; }
+  st->ticking = false;
+  if (st->mode != MODE_UP_SIZE && st->mode != MODE_UP_DATA && st->mode != MODE_DOWNLOAD) { return ALPH_CONTINUE; }
+  if (st->xfer != 0) { fd_xfer_touch(st->xfer, st->ctx->self); }
+  if (st->job == 0 && time_mono_ms() - st->x_last > g_xfer_stall_ms) { return stalled(st); }
+  st->ticking = true;
+  alph_send_after(st->ctx, fd_xfer_tick_ms(), st->ctx->self, TAG_TICK, st->tick_gen);
+  return ALPH_CONTINUE;
+}
+
+// The answer to a command job: the reply, then what the command asked for.
 fn command_done(st: FdSession*, o: FdJobOut*, size: int64) {
   var hdr: int64 = (int64)sizeof(FdJobOut);
-  if (size < hdr + o->reply_len + o->bulk_len) { busy_error(st, JOB_CMD, "short result"); return; }
+  if (size < hdr + o->reply_len) { busy_error(st, JOB_CMD, "short result"); return; }
   memcpy((rawptr)&st->sess, (rawptr)&o->sess, (int64)sizeof(FdSess));
   var reply: uint8* = (uint8*)o + hdr;
   out_put(st, (rawptr)reply, o->reply_len);
   var act: int32 = st->sess.action;
   if (act == FD_ACT_UPLOAD) {
-    out_str(st, "READY: Send file data (base64 encoded). END with 'EOF' on a new line.\n");
-    st->mode = MODE_UPLOAD;
-    st->up_len = 0;
-    st->up_over = false;
+    if (st->sess.up_lz4) { out_str(st, READY_LZ4); } else { out_str(st, READY); }
+    st->mode = MODE_UP_SIZE;
+    start_ticks(st);
     return;
   }
-  if (act == FD_ACT_BULK) {
-    out_put(st, (rawptr)(reply + o->reply_len), o->bulk_len);
-    out_str(st, FD_DOWNLOAD_TAIL);
+  if (act == FD_ACT_DOWNLOAD) {
+    st->xfer = st->sess.xfer;
+    st->x_left = 0;
+    st->mode = MODE_DOWNLOAD;
+    start_ticks(st);
+    return;
   }
   out_str(st, "CMD_END\n");
   if (act == FD_ACT_QUIT) { st->why = "quit"; st->closing = true; }
@@ -416,35 +589,10 @@ fn command_done(st: FdSession*, o: FdJobOut*, size: int64) {
   if (act == FD_ACT_SHUTDOWN) { st->why = "server shutdown"; st->shutting = true; }   // acted on once the reply is written
 }
 
-// Bytes before the upload data in st->up: room for the job header.
-fn up_hdr() -> int64 { return (int64)sizeof(FdJobIn); }
-
-fn handle_upload_line(st: FdSession*, line: string) {
-  if (line == "EOF") {
-    st->mode = MODE_CMD;
-    finish_upload(st);
-    return;
-  }
-  if (st->up_over) { return; }
-  var n: int64 = (int64)line.length;
-  if (st->up_len + n > UPLOAD_MAX) { st->up_over = true; return; }
-  var need: int64 = up_hdr() + st->up_len + n;
-  if (need > st->up_cap) {
-    var cap: int64 = st->up_cap * 2;
-    if (cap < need) { cap = need; }
-    if (cap < 65536) { cap = 65536; }
-    var p: rawptr = alph_realloc(st->ctx, (rawptr)st->up, cap);   // ptr 0 allocates
-    if (p == 0) { st->up_over = true; return; }
-    st->up = (uint8*)p;
-    st->up_cap = cap;
-  }
-  memcpy((rawptr)(st->up + up_hdr() + st->up_len), (rawptr)line.chars, n);
-  st->up_len = st->up_len + n;
-}
-
 fn handle_line(st: FdSession*, line: string) {
   if (st->mode == MODE_AUTH) { handle_auth(st, line); return; }
-  if (st->mode == MODE_UPLOAD) { handle_upload_line(st, line); return; }
+  if (st->mode == MODE_UP_SIZE) { handle_size(st, line); return; }
+  if (st->mode == MODE_UP_DATA) { handle_data(st, line); return; }
   run_command(st, str_trim(line));
 }
 
@@ -466,9 +614,12 @@ fn end_session(ctx: AlphCtx*, st: FdSession*) -> int64 {
 }
 
 // Runs once when the session exits for any reason, crash included, before alph
-// closes the socket: closes the TLS state (close_notify if it can be sent).
+// closes the socket: detaches the session's transfers (their files are closed,
+// a partial upload is kept for resume) and closes the TLS state (close_notify
+// if it can be sent).
 fn session_exit(ctx: AlphCtx*, reason: int64) -> int64 {
   var st: FdSession* = (FdSession*)ctx->state;
+  fd_xfer_detach(ctx->self);
   if (st->tls_on) { mtls_nb_close(&st->tls); }
   return 0;
 }
@@ -498,6 +649,11 @@ fn settle(ctx: AlphCtx*, st: FdSession*) -> int64 {
       return end_session(ctx, st);
     }
   }
+  if (st->mode == MODE_DOWNLOAD) {
+    if (left < st->x_left) { st->x_last = time_mono_ms(); }   // the reader is taking it
+    download_more(st);
+  }
+  st->x_left = left;
   if (st->shutting) {
     st->shutting = false;
     alph_shutdown(ctx, 500, 0);   // the reply was queued first; flushed above
@@ -515,10 +671,13 @@ fn settle(ctx: AlphCtx*, st: FdSession*) -> int64 {
   return ALPH_CONTINUE;
 }
 
-// Runs every complete line in the buffer, until a job is started.
+// Runs every complete line in the buffer, until a job is started. During a
+// download lines wait in the buffer.
 fn run_lines(st: FdSession*) {
   var line: string = "";
-  while (!st->closing && !st->broken && st->job == 0 && take_line(st, &line)) { handle_line(st, line); }
+  while (!st->closing && !st->broken && st->job == 0 && st->mode != MODE_DOWNLOAD && take_line(st, &line)) {
+    handle_line(st, line);
+  }
 }
 
 // Runs buffered lines, then reads what has arrived (bounded, so the handler
@@ -537,6 +696,7 @@ fn read_input(st: FdSession*) {
     if (!make_room(st)) {
       log_warn(fd_log(), "line too long", log_int("session", st->ctx->self), log_int("client", st->sess.client_id));
       out_str(st, "ERROR: Line too long\n");
+      if (st->mode != MODE_AUTH) { out_str(st, "CMD_END\n"); }
       st->why = "line too long";
       st->closing = true;
       return;
@@ -574,7 +734,8 @@ fn job_answer(st: FdSession*, m: AlphMsg*) {
     return;
   }
   if (kind == JOB_LOGIN || kind == JOB_SIGNUP) { auth_done(st, (FdJobOut*)data); }
-  else { command_done(st, (FdJobOut*)data, size); }
+  else if (kind == JOB_CMD) { command_done(st, (FdJobOut*)data, size); }
+  else { xfer_done(st, kind, (FdJobOut*)data, size); }
 }
 
 /// The session actor. Its state is a zeroed FdSession with the pool's pid; the
@@ -585,7 +746,9 @@ export fn fd_session_actor(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
   if (m->tag == ALPH_TAG_IO_GIVEN) {
     st->h = m->ref;
     fd_sess_init(&st->sess);
+    st->sess.pid = ctx->self;
     st->mode = MODE_AUTH;
+    alph_on_exit(ctx, &session_exit);
     alph_outq_init(&st->out, OUT_LIMIT);
     st->rbuf = (uint8*)alph_alloc(ctx, RBUF_START);
     if (st->rbuf == 0) {
@@ -604,7 +767,6 @@ export fn fd_session_actor(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
     log_info(fd_log(), "client connected", log_int("session", ctx->self), log_str("peer", peer),
              log_bool("tls", g_tls_on));
     if (g_tls_on) {
-      alph_on_exit(ctx, &session_exit);
       var trc: int32 = mtls_nb_server(&st->tls, alph_io_fd(ctx, st->h), &g_tls_cfg);   // alph keeps the socket
       if (trc != MTLS_OK) {
         log_error(fd_log(), "cannot start TLS for a client", log_int("session", ctx->self),
@@ -624,6 +786,7 @@ export fn fd_session_actor(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
     read_input(st);
     return settle(ctx, st);
   }
+  if (m->tag == TAG_TICK) { return on_tick(st, m->arg); }
   if (st->job != 0 && m->ref == st->job) {
     job_answer(st, m);
     read_input(st);   // lines that arrived while the job ran

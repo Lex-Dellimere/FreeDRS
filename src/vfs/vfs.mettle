@@ -19,19 +19,27 @@
 // MeoDB is the source of the entry list. Files that appear under the root
 // without going through the server are added to it by fd_vfs_refresh (at
 // startup and on the `refresh` command).
+//
+// Uploads are written to a temp file in root/.freedrs-tmp (mode 0700, emptied
+// by fd_vfs_init), then renamed into place by fd_vfs_commit. That name is
+// reserved: the resolver refuses it and refresh skips it. Temp files are
+// created with O_CREAT|O_EXCL, which never follows a link at the name, and
+// a link found where the temp directory or a file being opened should be is
+// refused (fs_lstat) instead of followed.
 
 import "std/mem";
 import "std/conv";
 import "std/file";
 import "std/fs";
 import "std/sync";
+import "crypto/crypto";
 import "freedrs/status";
 import "freedrs/auth/roles";
 import "freedrs/db/store";
 import "freedrs/db/models";
 
-/// Largest file accepted by fd_vfs_write, in bytes.
-export const FD_VFS_MAX_FILE: int64 = 16777216;
+/// The temp directory under the root (a reserved name).
+export const FD_VFS_TMP: string = ".freedrs-tmp";
 const FD_ROOT_CAP: int32 = 256;
 const FD_DISK_CAP: int32 = 1024;
 
@@ -124,7 +132,17 @@ export fn fd_vfs_resolve(cwd: string, input: string, out: FdVPath*) -> int32 {
     rc = fd_vp_apply(out, cwd);
     if (rc != FD_OK) { return rc; }
   }
-  return fd_vp_apply(out, s);
+  rc = fd_vp_apply(out, s);
+  if (rc == FD_OK && fd_vp_reserved(out)) { return FD_E_INVALID; }
+  return rc;
+}
+
+// True when the path is the temp directory or inside it.
+fn fd_vp_reserved(p: FdVPath*) -> bool {
+  var v: string = fd_vpath_str(p);
+  var n: int64 = (int64)FD_VFS_TMP.length;
+  if (str_starts_with(v, FD_VFS_TMP) == 0) { return false; }
+  return (int64)v.length == n || v.chars[n] == '/';
 }
 
 /// Like fd_vfs_resolve, but an empty `input` means the working directory itself.
@@ -182,7 +200,8 @@ fn fd_vpath_parent(vpath: string) -> string {
 
 // ---- operations ----
 
-/// Opens the VFS over root (created when missing, with parents).
+/// Opens the VFS over root (created when missing, with parents) and empties
+/// its temp directory.
 /// returns: FD_OK; FD_E_INVALID (root empty or too long); FD_E_IO
 export fn fd_vfs_init(v: FdVfs*, db: FdDb*, root: string) -> int32 {
   if (v == 0 || db == 0) { return FD_E_USAGE; }
@@ -193,7 +212,12 @@ export fn fd_vfs_init(v: FdVfs*, db: FdDb*, root: string) -> int32 {
   v->root_len = (int32)root.length;
   // a trailing slash would double up in disk paths
   while (v->root_len > 1 && v->root[v->root_len - 1] == (uint8)'/') { v->root_len = v->root_len - 1; }
-  return fd_mkdir_p(str_from_bytes((cstring)&v->root[0], (int64)v->root_len));
+  var rc: int32 = fd_mkdir_p(str_from_bytes((cstring)&v->root[0], (int64)v->root_len));
+  if (rc != FD_OK) { return rc; }
+  var d: FdDiskPath;
+  if (!fd_disk_path(v, FD_VFS_TMP, &d)) { return FD_E_INVALID; }
+  fs_remove_all(fd_disk_str(&d));   // links are removed, not followed
+  return fd_tmp_dir(v);
 }
 
 /// Creates a directory entry (and the directory on disk, with parents).
@@ -213,12 +237,12 @@ export fn fd_vfs_mkdir(v: FdVfs*, vpath: string, owner: string) -> int32 {
   return rc;
 }
 
-/// Writes (creates or replaces) a file: bytes to disk, entry to MeoDB.
-/// returns: FD_OK; FD_E_TOO_BIG; FD_E_INVALID (a directory is there, or the
-///          path is the root); FD_E_IO; FD_E_DB
+/// Writes (creates or replaces) a file from memory: bytes to disk, entry to
+/// MeoDB. Uploads use the temp file calls below instead.
+/// returns: FD_OK; FD_E_INVALID (a directory is there, or the path is the
+///          root); FD_E_IO; FD_E_DB
 export fn fd_vfs_write(v: FdVfs*, vpath: string, data: uint8*, n: int64, owner: string) -> int32 {
   if (v == 0 || vpath.length == 0 || n < 0) { return FD_E_INVALID; }
-  if (n > FD_VFS_MAX_FILE) { return FD_E_TOO_BIG; }
   var d: FdDiskPath;
   if (!fd_disk_path(v, vpath, &d)) { return FD_E_INVALID; }
   var pd: FdDiskPath;
@@ -240,7 +264,7 @@ export fn fd_vfs_write(v: FdVfs*, vpath: string, data: uint8*, n: int64, owner: 
     off = off + w;
   }
   file_close(fd);
-  if (exists) { rc = fd_entry_touch(v->db, vpath, n); }
+  if (exists) { rc = fd_entry_touch(v->db, vpath, n, ""); }
   else { rc = fd_entry_add(v->db, vpath, FD_KIND_FILE, n, owner); }
   sync_mutex_unlock(&v->lock);
   return rc;
@@ -324,6 +348,181 @@ export fn fd_vfs_delete(v: FdVfs*, vpath: string, user: string, is_admin: bool) 
   return rc;
 }
 
+// ---- temp files and commit ----
+
+/// A temp file's name inside the temp directory.
+export struct FdTmpName {
+  buf: uint8[48];
+  len: int32;
+}
+
+export fn fd_tmp_name_str(t: FdTmpName*) -> string {
+  return str_from_bytes((cstring)&t->buf[0], (int64)t->len);
+}
+
+// root/.freedrs-tmp/name
+fn fd_tmp_path(v: FdVfs*, name: string, d: FdDiskPath*) -> bool {
+  var n: int64 = (int64)FD_VFS_TMP.length + 1 + (int64)name.length;
+  if (n > 120) { return false; }
+  var buf: uint8[128];
+  memcpy((rawptr)&buf[0], (rawptr)FD_VFS_TMP.chars, (int64)FD_VFS_TMP.length);
+  buf[(int64)FD_VFS_TMP.length] = (uint8)'/';
+  memcpy((rawptr)&buf[(int64)FD_VFS_TMP.length + 1], (rawptr)name.chars, (int64)name.length);
+  return fd_disk_path(v, str_from_bytes((cstring)&buf[0], n), d);
+}
+
+// Makes sure root/.freedrs-tmp is a real directory: a link there is removed
+// (never followed) and the directory made again, mode 0700.
+fn fd_tmp_dir(v: FdVfs*) -> int32 {
+  var d: FdDiskPath;
+  if (!fd_disk_path(v, FD_VFS_TMP, &d)) { return FD_E_INVALID; }
+  var st: FsStat;
+  if (fs_lstat(fd_disk_str(&d), &st) == 0) {
+    if (st.kind == FS_DIR) { return FD_OK; }
+    if (st.kind != FS_SYMLINK) { return FD_E_IO; }
+    if (file_remove(fd_disk_str(&d)) < 0) { return FD_E_IO; }   // unlinks the link itself
+  }
+  var r: int64 = fs_mkdir(fd_disk_str(&d), 0x1C0);   // 0700
+  if (r != 0 && r != -(int64)FS_EEXIST) { return FD_E_IO; }
+  if (fs_lstat(fd_disk_str(&d), &st) != 0 || st.kind != FS_DIR) { return FD_E_IO; }
+  return FD_OK;
+}
+
+/// Creates a new, empty temp file with a random name and opens it for reading
+/// and writing. The file is created exclusively, so nothing that is already at
+/// the name (a link included) is opened.
+/// returns: FD_OK, *name and *fd; FD_E_IO; FD_E_CRYPTO (no random bytes)
+export fn fd_vfs_tmp_create(v: FdVfs*, name: FdTmpName*, fd: int64*) -> int32 {
+  if (v == 0 || name == 0 || fd == 0) { return FD_E_USAGE; }
+  var rc: int32 = fd_tmp_dir(v);
+  if (rc != FD_OK) { return rc; }
+  var rnd: uint8[16];
+  if (cr_random_bytes(&rnd[0], 16) != CR_OK) { return FD_E_CRYPTO; }
+  memcpy((rawptr)&name->buf[0], (rawptr)".up-".chars, 4);
+  var hl: int64 = 0;
+  if (cr_hex_encode(&name->buf[4], 44, &hl, &rnd[0], 16) != CR_OK) { return FD_E_CRYPTO; }
+  name->len = 4 + (int32)hl;
+  var d: FdDiskPath;
+  if (!fd_tmp_path(v, fd_tmp_name_str(name), &d)) { return FD_E_INVALID; }
+  var f: int64 = file_open(fd_disk_str(&d), FILE_READ | FILE_WRITE | FILE_CREATE | FILE_NEW);
+  if (f < 0) { return FD_E_IO; }
+  *fd = f;
+  return FD_OK;
+}
+
+/// Opens an existing temp file again (a resumed upload). Anything but a
+/// regular file at the name is refused.
+/// returns: FD_OK and *fd; FD_E_NOT_FOUND; FD_E_DENIED (not a regular file); FD_E_IO
+export fn fd_vfs_tmp_open(v: FdVfs*, name: string, fd: int64*) -> int32 {
+  if (v == 0 || fd == 0 || name.length == 0) { return FD_E_USAGE; }
+  if (fd_tmp_dir(v) != FD_OK) { return FD_E_IO; }
+  var d: FdDiskPath;
+  if (!fd_tmp_path(v, name, &d)) { return FD_E_INVALID; }
+  var st: FsStat;
+  if (fs_lstat(fd_disk_str(&d), &st) != 0) { return FD_E_NOT_FOUND; }
+  if (st.kind != FS_FILE) { return FD_E_DENIED; }
+  var f: int64 = file_open(fd_disk_str(&d), FILE_READ | FILE_WRITE);
+  if (f < 0) { return FD_E_IO; }
+  *fd = f;
+  return FD_OK;
+}
+
+/// Removes a temp file (a link at the name is unlinked, not followed).
+export fn fd_vfs_tmp_remove(v: FdVfs*, name: string) {
+  if (v == 0 || name.length == 0) { return; }
+  var d: FdDiskPath;
+  if (fd_tmp_path(v, name, &d)) { file_remove(fd_disk_str(&d)); }
+}
+
+/// Names in the temp directory, for tests: the count of entries.
+export fn fd_vfs_tmp_count(v: FdVfs*) -> int32 {
+  var d: FdDiskPath;
+  if (!fd_disk_path(v, FD_VFS_TMP, &d)) { return -1; }
+  var dir: FsDir* = (FsDir*)malloc((int64)sizeof(FsDir));
+  if (dir == 0) { return -1; }
+  if (fs_dir_open(fd_disk_str(&d), dir) != 0) { free((rawptr)dir); return -1; }
+  var n: int32 = 0;
+  var ent: FsDirEntry;
+  while (fs_dir_next(dir, &ent) > 0) {
+    if (ent.name != "." && ent.name != "..") { n = n + 1; }
+  }
+  fs_dir_close(dir);
+  free((rawptr)dir);
+  return n;
+}
+
+// Flushes a directory's entries (a rename in it) to the device.
+fn fd_sync_dir(disk: string) {
+  var fd: int64 = file_open(disk, FILE_READ);
+  if (fd < 0) { return; }
+  file_sync(fd);
+  file_close(fd);
+}
+
+/// Moves a finished temp file into place at vpath and writes its entry (size,
+/// owner for a new file, SHA-256 hex). The rename is atomic and replaces a
+/// link at vpath rather than following it. With quota > 0 the owner's stored
+/// bytes, less the old file if it is theirs, plus `size` must stay within it.
+/// The caller has already synced the file.
+/// returns: FD_OK; FD_E_QUOTA; FD_E_INVALID (a directory is there); FD_E_IO; FD_E_DB
+export fn fd_vfs_commit(v: FdVfs*, vpath: string, tmp: string, size: int64, owner: string, sha256: string,
+                        quota: int64) -> int32 {
+  if (v == 0 || vpath.length == 0 || size < 0) { return FD_E_INVALID; }
+  var d: FdDiskPath;
+  if (!fd_disk_path(v, vpath, &d)) { return FD_E_INVALID; }
+  var pd: FdDiskPath;
+  if (!fd_disk_path(v, fd_vpath_parent(vpath), &pd)) { return FD_E_INVALID; }
+  var td: FdDiskPath;
+  if (!fd_tmp_path(v, tmp, &td)) { return FD_E_INVALID; }
+  sync_mutex_lock(&v->lock);
+  var e: FdEntryInfo;
+  var rc: int32 = fd_entry_get(v->db, vpath, &e);
+  var exists: bool = rc == FD_OK;
+  if (exists && e.kind == FD_KIND_DIR) { sync_mutex_unlock(&v->lock); return FD_E_INVALID; }
+  if (!exists && rc != FD_E_NOT_FOUND) { sync_mutex_unlock(&v->lock); return rc; }
+  if (quota > 0) {
+    var used: int64 = 0;
+    rc = fd_entry_usage(v->db, owner, &used);
+    if (rc != FD_OK) { sync_mutex_unlock(&v->lock); return rc; }
+    if (exists && fd_entry_info_owner(&e) == owner) { used = used - e.size; }
+    if (used + size > quota) { sync_mutex_unlock(&v->lock); return FD_E_QUOTA; }
+  }
+  rc = fd_mkdir_p(fd_disk_str(&pd));
+  if (rc != FD_OK) { sync_mutex_unlock(&v->lock); return rc; }
+  var st: FsStat;
+  if (fs_lstat(fd_disk_str(&d), &st) == 0 && st.kind == FS_DIR) { sync_mutex_unlock(&v->lock); return FD_E_INVALID; }
+  if (file_rename(fd_disk_str(&td), fd_disk_str(&d)) < 0) { sync_mutex_unlock(&v->lock); return FD_E_IO; }
+  fd_sync_dir(fd_disk_str(&pd));
+  if (exists) { rc = fd_entry_touch(v->db, vpath, size, sha256); }
+  else { rc = fd_entry_add_hashed(v->db, vpath, FD_KIND_FILE, size, owner, sha256); }
+  sync_mutex_unlock(&v->lock);
+  return rc;
+}
+
+/// Opens a file entry for reading. A link or anything but a regular file on
+/// disk is refused. *e gets the entry (its sha256 may be empty).
+/// returns: FD_OK and *fd; FD_E_NOT_FOUND; FD_E_DENIED; FD_E_IO
+export fn fd_vfs_open_read(v: FdVfs*, vpath: string, fd: int64*, e: FdEntryInfo*) -> int32 {
+  if (v == 0 || fd == 0 || e == 0 || vpath.length == 0) { return FD_E_USAGE; }
+  var d: FdDiskPath;
+  if (!fd_disk_path(v, vpath, &d)) { return FD_E_INVALID; }
+  sync_mutex_lock(&v->lock);
+  var rc: int32 = fd_entry_get(v->db, vpath, e);
+  if (rc != FD_OK || e->kind != FD_KIND_FILE) {
+    sync_mutex_unlock(&v->lock);
+    if (rc == FD_OK) { return FD_E_NOT_FOUND; }
+    return rc;
+  }
+  var st: FsStat;
+  if (fs_lstat(fd_disk_str(&d), &st) != 0) { sync_mutex_unlock(&v->lock); return FD_E_NOT_FOUND; }
+  if (st.kind != FS_FILE) { sync_mutex_unlock(&v->lock); return FD_E_DENIED; }
+  var f: int64 = file_open(fd_disk_str(&d), FILE_READ);
+  sync_mutex_unlock(&v->lock);
+  if (f < 0) { return FD_E_IO; }
+  *fd = f;
+  return FD_OK;
+}
+
 // Deepest directory level refresh descends into.
 const FD_WALK_DEPTH: int32 = 32;
 
@@ -347,6 +546,7 @@ fn fd_walk(v: FdVfs*, vdir: string, owner: string, depth: int32, added: int32*) 
     if (ent.kind != FS_FILE && ent.kind != FS_DIR) { continue; }
     var name: string = ent.name;
     if (name.length == 0 || !fd_seg_ok(name)) { continue; }
+    if (vdir.length == 0 && name == FD_VFS_TMP) { continue; }
     var n: int64 = (int64)vdir.length;
     if (n > 0) { n = n + 1; }
     if (n + (int64)name.length > (int64)FD_PATH_MAX) { continue; }
@@ -425,5 +625,8 @@ fn t_resolve(cwd: string, input: string, want: string) -> bool {
   if (fd_vfs_resolve("/", "a\\b", &p) != FD_E_TRAVERSAL) { return 5; }
   if (fd_vfs_resolve("/", "", &p) != FD_E_INVALID) { return 6; }
   if (fd_vfs_resolve_or_cwd("/x", "", &p) != FD_OK || fd_vpath_str(&p) != "x") { return 7; }
+  if (fd_vfs_resolve("/", ".freedrs-tmp/x", &p) != FD_E_INVALID) { return 8; }
+  if (fd_vfs_resolve("/.freedrs-tmp", "x", &p) != FD_E_INVALID) { return 9; }
+  if (!t_resolve("/", ".freedrs-tmpx", ".freedrs-tmpx")) { return 10; }
   return 0;
 }

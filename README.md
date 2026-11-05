@@ -16,6 +16,8 @@ FreeDRS is a distributed resource system written in [Mettle](https://github.com/
 | Server log | log |
 | `serverinfo` command | sysinfo |
 | Optional TLS | mtls |
+| SHA-256 of transfers | cryptex |
+| Optional LZ4 on the wire | press |
 
 ## Layout
 
@@ -26,7 +28,7 @@ src/config/          server_config.json loading and saving
 src/db/              flux_orm models and store
 src/vfs/             root-confined virtual file system
 src/server/          alph server: boss, acceptor, session actors, commands
-src/client/          freedrs_client CLI
+src/client/          freedrs_client CLI and its streaming transfers
 src/setup/           freedrs_setup: default roles and admin user
 tests/               mbuild test suites (unit and end-to-end)
 docs/                wire protocol
@@ -34,7 +36,7 @@ docs/                wire protocol
 
 ## Build and run
 
-All of it goes through [mbuild](https://github.com/Lex-Dellimere/mbuild). The path dependencies expect the Mettle workspace layout (`../meodb`, `../flux_orm`, `../raize_web/libs/auth`, `../cryptex`, `../alph`, `../codec`, `../args`, `../log`, `../sysinfo`, `../mtls` next to this repo).
+All of it goes through [mbuild](https://github.com/Lex-Dellimere/mbuild). The path dependencies expect the Mettle workspace layout (`../meodb`, `../flux_orm`, `../raize_web/libs/auth`, `../cryptex`, `../alph`, `../codec`, `../args`, `../log`, `../sysinfo`, `../mtls`, `../press` next to this repo).
 
 ```
 mbuild build
@@ -54,6 +56,17 @@ Every program takes `--help` and `--version`.
 | `freedrs_client` | `[HOST[:PORT]]`, `--guest`, `--user NAME`, `--pass PASSWORD`, `--tls`, `--ca FILE` |
 
 The server logs to stderr; `METTLE_LOG=debug` changes the level.
+
+## Transfers
+
+Uploads and downloads stream in 64 KiB pieces, so file size is limited only by the role's max file size and the user's quota (`setmaxfile`, `setquota`; setup sets the defaults). Every transfer is checked end to end with SHA-256. The server writes uploads to a temp file under the root and renames it into place once the hash matches; the client does the same next to the target file for downloads. The client shows progress on a terminal.
+
+```
+upload big.iso isos/big.iso
+upload --resume big.iso isos/big.iso       # go on after a broken connection
+download --lz4 logs/today.txt              # LZ4 on the wire, for text and the like
+download --resume isos/big.iso
+```
 
 ## TLS
 

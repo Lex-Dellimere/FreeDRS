@@ -1,0 +1,489 @@
+// freedrs/client/xfer: streaming upload and download over the client
+// connection (conn.mettle). Files are read and written a piece at a time, so
+// memory stays flat whatever their size.
+//
+// Upload: `upload [--lz4] [--resume] <name> <remote>`, READY, SIZE, OFFSET,
+// then one base64 line per piece (a multiple of 3 bytes, or with LZ4 one
+// frame per piece), then `EOF <sha256-hex>`. A line from the server before
+// the end means it refused the data; the upload stops there.
+//
+// Download: into `<local>.freedrs-part` next to the target, renamed over the
+// target only after the size and the SHA-256 check out. With resume, the part
+// file's size is the offset to ask for, and its bytes are hashed first. A
+// broken connection leaves the part file for resume; a bad hash removes it.
+
+import "std/io";
+import "std/mem";
+import "std/conv";
+import "std/time";
+import "std/file";
+import "std/fs";
+import "std/arena";
+import "std/strbuf";
+import "std/encoding";
+import "crypto/crypto";
+import "press/press";
+import "freedrs/client/conn";
+
+/// Raw bytes one line may carry, when the server does not say.
+const CHUNK_MAX: int64 = 65536;
+/// Room LZ4 frame overhead needs within a line.
+const LZ4_SLACK: int64 = 64;
+const LINE_CAP: int64 = 87384 + 64;
+const PART_SUFFIX: string = ".freedrs-part";
+
+export struct FdXferOpts {
+  lz4: bool;
+  resume: bool;
+  progress: bool;   // print bytes and rate (on a terminal)
+  quiet: bool;      // print no reply lines (tests)
+}
+
+export struct FdXferStats {
+  offset: int64;    // where the transfer started (resume)
+  bytes: int64;     // file bytes moved
+  wire: int64;      // base64 text bytes on the wire for them
+  ms: int64;
+  lz4: bool;        // the server agreed to LZ4
+  last: uint8[256]; // the last reply line (SUCCESS: or ERROR:)
+  last_len: int32;
+}
+
+export fn fd_xfer_stats_last(s: FdXferStats*) -> string {
+  return str_from_bytes((cstring)&s->last[0], (int64)s->last_len);
+}
+
+fn set_last(st: FdXferStats*, line: string) {
+  var n: int64 = (int64)line.length;
+  if (n > 256) { n = 256; }
+  memcpy((rawptr)&st->last[0], (rawptr)line.chars, n);
+  st->last_len = (int32)n;
+}
+
+// The reply after the transfer: lines up to CMD_END, printed unless quiet.
+// The last one is kept. false when the connection is gone.
+fn finish_reply(o: FdXferOpts*, st: FdXferStats*) -> bool {
+  var line: string;
+  while (fd_conn_next_line(&line)) {
+    if (line == "CMD_END") { fd_conn_free_line(line); return true; }
+    if (!o->quiet) { println(line); }
+    set_last(st, line);
+    fd_conn_free_line(line);
+  }
+  if (!o->quiet) { println_err("freedrs: connection closed by the server"); }
+  return false;
+}
+
+// One line, kept as the reply, then the rest up to CMD_END.
+fn refused(o: FdXferOpts*, st: FdXferStats*, first: string) -> int32 {
+  var cmd_end: bool = first == "CMD_END";
+  if (!cmd_end) {
+    if (!o->quiet) { println(first); }
+    set_last(st, first);
+  }
+  fd_conn_free_line(first);
+  if (cmd_end) { return 1; }
+  if (!finish_reply(o, st)) { return -1; }
+  return 1;
+}
+
+fn local_error(o: FdXferOpts*, st: FdXferStats*, msg: string) -> int32 {
+  if (!o->quiet) { println_err(msg); }
+  set_last(st, msg);
+  return 1;
+}
+
+// A count of 1..18 digits; -1 otherwise.
+fn parse_count(s: string) -> int64 {
+  if (s.length == 0 || s.length > 18) { return -1; }
+  var v: int64 = 0;
+  var i: int64 = 0;
+  while (i < (int64)s.length) {
+    var c: char = s.chars[i];
+    if (c < '0' || c > '9') { return -1; }
+    v = v * 10 + (int64)(c - '0');
+    i = i + 1;
+  }
+  return v;
+}
+
+// ---- progress ----
+
+struct Progress {
+  on: bool;
+  start: int64;
+  last: int64;
+  total: int64;
+}
+
+fn put_size(b: StrBuf*, bytes: int64) {
+  if (bytes < 1048576) {
+    strbuf_append_int(b, bytes / 1024);
+    strbuf_append_string(b, " KiB");
+    return;
+  }
+  var tenths: int64 = bytes * 10 / 1048576;
+  strbuf_append_int(b, tenths / 10);
+  strbuf_append_string(b, ".");
+  strbuf_append_int(b, tenths % 10);
+  strbuf_append_string(b, " MiB");
+}
+
+// Shows "done / total  rate" on one line, at most every 200 ms (and at the end).
+fn progress(p: Progress*, done: int64, last: bool) {
+  if (!p->on) { return; }
+  var now: int64 = time_mono_ms();
+  if (!last && now - p->last < 200) { return; }
+  p->last = now;
+  var ms: int64 = now - p->start;
+  if (ms < 1) { ms = 1; }
+  var a: Arena* = arena_init(512);
+  if (a == 0) { return; }
+  var sb: StrBuf* = strbuf_new(a, 128);
+  strbuf_append_string(sb, "\r  ");
+  put_size(sb, done);
+  strbuf_append_string(sb, " / ");
+  put_size(sb, p->total);
+  strbuf_append_string(sb, "  ");
+  put_size(sb, done * 1000 / ms);
+  strbuf_append_string(sb, "/s   ");
+  print(strbuf_finish_string(sb));
+  if (last) { print("\n"); }
+  fflush(get_stdout());
+  arena_free(a);
+}
+
+// ---- upload ----
+
+// Hashes the first n bytes of fd into sha. false on a read error.
+fn hash_prefix(fd: int64, n: int64, sha: CrSha256State*, buf: uint8*) -> bool {
+  var at: int64 = 0;
+  while (at < n) {
+    var k: int64 = n - at;
+    if (k > CHUNK_MAX) { k = CHUNK_MAX; }
+    var r: int64 = file_read_at(fd, buf, k, at);
+    if (r <= 0) { return false; }
+    cr_sha256_update(sha, buf, r);
+    at = at + r;
+  }
+  return true;
+}
+
+fn hex_digest(sha: CrSha256State*, out: uint8*) -> string {
+  var d: CrSha256;
+  cr_sha256_final(sha, &d);
+  var hl: int64 = 0;
+  cr_hex_encode(out, 65, &hl, &d.b[0], 32);
+  return str_from_bytes((cstring)out, 64);
+}
+
+fn base_name(path: string) -> string {
+  var i: int64 = (int64)path.length - 1;
+  while (i >= 0 && path.chars[i] != '/') { i = i - 1; }
+  return str_slice(path, i + 1, (int64)path.length - i - 1);
+}
+
+// The upload proper, once the local file is open: returns as fd_client_upload.
+fn upload_open(fd: int64, size: int64, name: string, remote: string, o: FdXferOpts*, st: FdXferStats*,
+               raw: uint8*, text: uint8*) -> int32 {
+  var cmd: string = "upload";
+  if (o->lz4) { cmd = cmd + " --lz4"; }
+  if (o->resume) { cmd = cmd + " --resume"; }
+  if (!fd_conn_send_line("{cmd} {name} {remote}")) { return -1; }
+  var line: string;
+  if (!fd_conn_next_line(&line)) { return -1; }
+  if (str_starts_with(line, "READY: ") == 0) { return refused(o, st, line); }
+  // READY: <max-chunk-bytes>[ lz4]
+  var rest: string = str_slice(line, 7, (int64)line.length - 7);
+  var sp: int64 = 0;
+  while (sp < (int64)rest.length && rest.chars[sp] != ' ') { sp = sp + 1; }
+  var max: int64 = parse_count(str_slice(rest, 0, sp));
+  st->lz4 = sp < (int64)rest.length && str_slice(rest, sp, (int64)rest.length - sp) == " lz4";
+  fd_conn_free_line(line);
+  if (max < 3 || max > CHUNK_MAX) { return local_error(o, st, "ERROR: bad READY line from the server"); }
+  var piece: int64 = max / 3 * 3;
+  if (st->lz4) { piece = (max - LZ4_SLACK) / 3 * 3; }
+
+  if (!fd_conn_send_line("SIZE {size}")) { return -1; }
+  if (!fd_conn_next_line(&line)) { return -1; }
+  if (str_starts_with(line, "OFFSET ") == 0) { return refused(o, st, line); }
+  var off: int64 = parse_count(str_slice(line, 7, (int64)line.length - 7));
+  fd_conn_free_line(line);
+  if (off < 0 || off > size) { return local_error(o, st, "ERROR: bad OFFSET line from the server"); }
+  st->offset = off;
+
+  var sha: CrSha256State;
+  cr_sha256_init(&sha);
+  if (!hash_prefix(fd, off, &sha, raw)) { return local_error(o, st, "ERROR: cannot read the local file"); }
+  var pb: PressBuf;
+  memset((rawptr)&pb, 0, (int64)sizeof(PressBuf));
+  var p: Progress;
+  p.on = o->progress;
+  p.start = time_mono_ms();
+  p.last = 0;
+  p.total = size;
+  var t0: int64 = time_mono_ms();
+  while (off < size) {
+    var n: int64 = size - off;
+    if (n > piece) { n = piece; }
+    var got: int64 = 0;
+    while (got < n) {
+      var r: int64 = file_read_at(fd, raw + got, n - got, off + got);
+      if (r <= 0) { press_buf_free(&pb); return local_error(o, st, "ERROR: cannot read the local file"); }
+      got = got + r;
+    }
+    cr_sha256_update(&sha, raw, n);
+    var data: uint8* = raw;
+    var dn: int64 = n;
+    if (st->lz4) {
+      var enc: PressLz4Enc;
+      pb.len = 0;
+      press_lz4_enc_init(&enc, 1);
+      var prc: int32 = press_lz4_enc_feed(&enc, raw, n, &pb);
+      if (prc == PRESS_OK) { prc = press_lz4_enc_finish(&enc, &pb); }
+      press_lz4_enc_free(&enc);
+      if (prc != PRESS_OK || pb.len > max) { press_buf_free(&pb); return local_error(o, st, "ERROR: compression failed"); }
+      data = pb.data;
+      dn = pb.len;
+    }
+    var tl: int64 = 0;
+    match (base64_encode(str_from_bytes((cstring)data, dn), (cstring)text, LINE_CAP)) {
+      case Ok(t): { tl = (int64)t.length; }
+      case Err(why): { press_buf_free(&pb); return local_error(o, st, "ERROR: {why}"); }
+    }
+    text[tl] = (uint8)10;
+    if (!fd_conn_send_bytes(text, tl + 1)) { press_buf_free(&pb); return -1; }
+    st->wire = st->wire + tl + 1;
+    off = off + n;
+    st->bytes = st->bytes + n;
+    progress(&p, off, false);
+    // the server only speaks now to refuse the data
+    if (fd_conn_try_line(&line)) { press_buf_free(&pb); progress(&p, off, true); return refused(o, st, line); }
+  }
+  press_buf_free(&pb);
+  progress(&p, off, true);
+  var hx: uint8[65];
+  var hex: string = hex_digest(&sha, &hx[0]);
+  if (!fd_conn_send_line("EOF {hex}")) { return -1; }
+  if (!finish_reply(o, st)) { return -1; }
+  st->ms = time_mono_ms() - t0;
+  if (str_starts_with(fd_xfer_stats_last(st), "SUCCESS") != 0) { return 0; }
+  return 1;
+}
+
+/// Uploads the local file to `remote` (a server path; "" = the file's name).
+/// Prints the server's reply unless quiet. Call between fd_conn_busy(true)
+/// and fd_conn_busy(false).
+/// returns: 0 done; 1 refused or failed (the reply or message is in st);
+///          -1 the connection is gone
+export fn fd_client_upload(local: string, remote: string, o: FdXferOpts*, st: FdXferStats*) -> int32 {
+  memset((rawptr)st, 0, (int64)sizeof(FdXferStats));
+  var name: string = base_name(local);
+  if (name.length == 0) { return local_error(o, st, "ERROR: Usage: upload [--lz4] [--resume] <local-file> [remote]"); }
+  var target: string = remote;
+  if (target.length == 0) { target = name; }
+  var fs: FsStat;
+  if (fs_stat(local, &fs) != 0 || fs.kind != FS_FILE) { return local_error(o, st, "ERROR: cannot open local file {local}"); }
+  var fd: int64 = file_open(local, FILE_READ);
+  if (fd < 0) { return local_error(o, st, "ERROR: cannot open local file {local}"); }
+  var size: int64 = file_size(fd);
+  var raw: uint8* = (uint8*)malloc(CHUNK_MAX + 64);
+  var text: uint8* = (uint8*)malloc(LINE_CAP + 8);
+  var rc: int32 = 1;
+  if (size < 0 || raw == 0 || text == 0) {
+    rc = local_error(o, st, "ERROR: cannot read local file {local}");
+  } else {
+    rc = upload_open(fd, size, name, target, o, st, raw, text);
+  }
+  if (raw != 0) { free((rawptr)raw); }
+  if (text != 0) { free((rawptr)text); }
+  file_close(fd);
+  return rc;
+}
+
+// ---- download ----
+
+// Writes all n bytes at off. false on an error.
+fn write_full(fd: int64, p: uint8*, n: int64, off: int64) -> bool {
+  var done: int64 = 0;
+  while (done < n) {
+    var w: int64 = file_write_at(fd, p + done, n - done, off + done);
+    if (w <= 0) { return false; }
+    done = done + w;
+  }
+  return true;
+}
+
+// Drains the rest of a download after a local failure, so the connection
+// stays in step: everything up to CMD_END is dropped.
+fn skip_to_end() -> bool {
+  var line: string;
+  while (fd_conn_next_line(&line)) {
+    var end: bool = line == "CMD_END";
+    fd_conn_free_line(line);
+    if (end) { return true; }
+  }
+  return false;
+}
+
+// The data lines and END_FILE, once FILE_DATA said `count` bytes follow:
+// 0 done (hash checked), 1 failed, -1 connection gone. *keep says whether the
+// part file is still worth resuming.
+fn download_body(fd: int64, off0: int64, count: int64, lz4: bool, o: FdXferOpts*, st: FdXferStats*,
+                 sha: CrSha256State*, raw: uint8*, keep: bool*) -> int32 {
+  var off: int64 = off0;
+  var end: int64 = off0 + count;
+  var pb: PressBuf;
+  memset((rawptr)&pb, 0, (int64)sizeof(PressBuf));
+  press_buf_limit(&pb, CHUNK_MAX);
+  var p: Progress;
+  p.on = o->progress;
+  p.start = time_mono_ms();
+  p.last = 0;
+  p.total = end;
+  var line: string;
+  var rc: int32 = 0;
+  var why: string = "";
+  while (true) {
+    if (!fd_conn_next_line(&line)) { press_buf_free(&pb); progress(&p, off, true); return -1; }
+    if (str_starts_with(line, "END_FILE") != 0 || str_starts_with(line, "ERROR") != 0) { break; }
+    var n: int64 = 0;
+    var bad: bool = (int64)line.length > LINE_CAP;
+    if (!bad) {
+      match (base64_decode(line, (cstring)raw, CHUNK_MAX + 64)) {
+        case Ok(d): { n = (int64)d.length; }
+        case Err(e): { bad = true; }
+      }
+    }
+    st->wire = st->wire + (int64)line.length + 1;
+    fd_conn_free_line(line);
+    var data: uint8* = raw;
+    if (!bad && lz4) {
+      var dec: PressLz4Dec;
+      press_lz4_dec_init(&dec);
+      press_buf_limit(&dec.win, CHUNK_MAX);
+      pb.len = 0;
+      var prc: int32 = press_lz4_dec_feed(&dec, raw, n, &pb);
+      if (prc == PRESS_OK) { prc = press_lz4_dec_finish(&dec); }
+      press_lz4_dec_free(&dec);
+      bad = prc != PRESS_OK;
+      data = pb.data;
+      n = pb.len;
+    }
+    if (bad || n == 0 || off + n > end) {
+      why = "ERROR: bad file data from the server";
+      *keep = false;
+      rc = 1;
+      break;
+    }
+    cr_sha256_update(sha, data, n);
+    if (!write_full(fd, data, n, off)) {
+      why = "ERROR: cannot write the local file";
+      rc = 1;
+      break;
+    }
+    off = off + n;
+    st->bytes = st->bytes + n;
+    progress(&p, off, false);
+  }
+  press_buf_free(&pb);
+  progress(&p, off, true);
+  if (rc != 0) {
+    if (!skip_to_end()) { return -1; }
+    return local_error(o, st, why);
+  }
+  if (str_starts_with(line, "ERROR") != 0) { return refused(o, st, line); }
+  // END_FILE <sha256-hex>
+  var hx: uint8[65];
+  var mine: string = hex_digest(sha, &hx[0]);
+  var theirs: string = str_slice(line, 9, (int64)line.length - 9);
+  var ok: bool = off == end && (int64)line.length == 73 && theirs == mine;
+  fd_conn_free_line(line);
+  if (!finish_reply(o, st)) { return -1; }
+  if (!ok) {
+    *keep = false;
+    return local_error(o, st, "ERROR: download does not match the server's hash, discarded");
+  }
+  if (str_starts_with(fd_xfer_stats_last(st), "SUCCESS") == 0) { *keep = false; return 1; }
+  return 0;
+}
+
+/// Downloads server file `remote` to `local` ("" = its name, in the current
+/// directory). Call between fd_conn_busy(true) and fd_conn_busy(false).
+/// returns: 0 done; 1 refused or failed; -1 the connection is gone (a part
+///          file is left for --resume)
+export fn fd_client_download(remote: string, local: string, o: FdXferOpts*, st: FdXferStats*) -> int32 {
+  memset((rawptr)st, 0, (int64)sizeof(FdXferStats));
+  var target: string = local;
+  if (target.length == 0) { target = base_name(remote); }
+  if (target.length == 0 || remote.length == 0) {
+    return local_error(o, st, "ERROR: Usage: download [--lz4] [--resume] <remote-file> [local]");
+  }
+  var part: string = target + PART_SUFFIX;
+  var off: int64 = 0;
+  var fd: int64 = -1;
+  var fs: FsStat;
+  var have: bool = fs_lstat(part, &fs) == 0;
+  if (have && fs.kind != FS_FILE) { return local_error(o, st, "ERROR: {part} is not a regular file"); }
+  if (o->resume && have) {
+    fd = file_open(part, FILE_READ | FILE_WRITE);
+    if (fd >= 0) { off = file_size(fd); }
+  } else {
+    if (have) { file_remove(part); }
+    fd = file_open(part, FILE_READ | FILE_WRITE | FILE_CREATE | FILE_NEW);
+  }
+  if (fd < 0 || off < 0) {
+    if (fd >= 0) { file_close(fd); }
+    return local_error(o, st, "ERROR: cannot write {part}");
+  }
+  st->offset = off;
+  var raw: uint8* = (uint8*)malloc(CHUNK_MAX + 64);
+  if (raw == 0) { file_close(fd); return local_error(o, st, "ERROR: out of memory"); }
+  var sha: CrSha256State;
+  cr_sha256_init(&sha);
+  var rc: int32 = 1;
+  var keep: bool = true;
+  if (!hash_prefix(fd, off, &sha, raw)) {
+    rc = local_error(o, st, "ERROR: cannot read {part}");
+  } else {
+    var cmd: string = "download";
+    if (o->lz4) { cmd = cmd + " --lz4"; }
+    var t0: int64 = time_mono_ms();
+    if (!fd_conn_send_line("{cmd} {remote} {off}")) {
+      rc = -1;
+    } else {
+      var line: string;
+      if (!fd_conn_next_line(&line)) {
+        rc = -1;
+      } else if (str_starts_with(line, "FILE_DATA: ") == 0) {
+        keep = off > 0;
+        rc = refused(o, st, line);
+      } else {
+        var rest: string = str_slice(line, 11, (int64)line.length - 11);
+        var sp: int64 = 0;
+        while (sp < (int64)rest.length && rest.chars[sp] != ' ') { sp = sp + 1; }
+        var count: int64 = parse_count(str_slice(rest, 0, sp));
+        st->lz4 = sp < (int64)rest.length && str_slice(rest, sp, (int64)rest.length - sp) == " lz4";
+        fd_conn_free_line(line);
+        if (count < 0) {
+          keep = false;
+          if (!skip_to_end()) { rc = -1; } else { rc = local_error(o, st, "ERROR: bad FILE_DATA line from the server"); }
+        } else {
+          rc = download_body(fd, off, count, st->lz4, o, st, &sha, raw, &keep);
+        }
+      }
+    }
+    st->ms = time_mono_ms() - t0;
+  }
+  free((rawptr)raw);
+  if (rc == 0) {
+    if (file_sync(fd) < 0) { rc = local_error(o, st, "ERROR: cannot write {part}"); keep = false; }
+  }
+  file_close(fd);
+  if (rc == 0) {
+    if (file_rename(part, target) < 0) { rc = local_error(o, st, "ERROR: cannot rename {part} to {target}"); }
+  } else if (!keep || (off == 0 && st->bytes == 0)) {
+    file_remove(part);   // nothing worth resuming
+  }
+  return rc;
+}

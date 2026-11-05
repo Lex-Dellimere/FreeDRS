@@ -40,6 +40,7 @@ export struct FdUserInfo {
   username_len: int32;
   role: uint8[64];
   role_len: int32;
+  quota: int64;      // bytes, 0 = the default
 }
 
 export struct FdRoleInfo {
@@ -47,6 +48,7 @@ export struct FdRoleInfo {
   name_len: int32;
   commands: uint8[1024];
   commands_len: int32;
+  max_file: int64;   // bytes, 0 = the default
 }
 
 export struct FdEntryInfo {
@@ -58,6 +60,8 @@ export struct FdEntryInfo {
   owner_len: int32;
   created: int64;    // unix seconds
   modified: int64;   // unix seconds
+  sha256: uint8[64]; // lowercase hex, sha256_len 0 when unknown
+  sha256_len: int32;
 }
 
 export fn fd_user_info_name(u: FdUserInfo*) -> string {
@@ -78,6 +82,9 @@ export fn fd_entry_info_path(e: FdEntryInfo*) -> string {
 export fn fd_entry_info_owner(e: FdEntryInfo*) -> string {
   return str_from_bytes((cstring)&e->owner[0], (int64)e->owner_len);
 }
+export fn fd_entry_info_sha256(e: FdEntryInfo*) -> string {
+  return str_from_bytes((cstring)&e->sha256[0], (int64)e->sha256_len);
+}
 
 // Copies s into dst (capacity cap), setting *len; truncates, never overflows.
 fn fd_put(dst: uint8*, cap: int32, len: int32*, s: string) {
@@ -91,11 +98,13 @@ fn fd_user_fill(out: FdUserInfo*, u: FdUser*) {
   out->id = u->id;
   fd_put(&out->username[0], 64, &out->username_len, u->username);
   fd_put(&out->role[0], 64, &out->role_len, u->role);
+  out->quota = u->quota;
 }
 
 fn fd_role_fill(out: FdRoleInfo*, r: FdRole*) {
   fd_put(&out->name[0], 64, &out->name_len, r->name);
   fd_put(&out->commands[0], 1024, &out->commands_len, r->commands);
+  out->max_file = r->max_file;
 }
 
 fn fd_entry_fill(out: FdEntryInfo*, e: FdEntry*) {
@@ -105,6 +114,8 @@ fn fd_entry_fill(out: FdEntryInfo*, e: FdEntry*) {
   fd_put(&out->owner[0], 64, &out->owner_len, e->owner);
   out->created = e->created;
   out->modified = e->modified;
+  out->sha256_len = 0;
+  if ((int64)e->sha256.length == 64) { fd_put(&out->sha256[0], 64, &out->sha256_len, e->sha256); }
 }
 
 // flux_orm status -> FD status.
@@ -141,10 +152,10 @@ export fn fd_db_open(db: FdDb*, addr: string, token: string) -> int32 {
   if (rc_meodb_pool(&db->pool, FD_POOL_SIZE, token, addr) != RC_OK) { return FD_E_DB; }
   db->is_open = true;
 
-  var migs: RcMigration[4];
+  var migs: RcMigration[7];
   fd_migrations(&migs[0]);
   rfa_migration(&migs[3], 4);
-  var set: RcMigrationSet = rc_migration_set(&migs[0], 4);
+  var set: RcMigrationSet = rc_migration_set(&migs[0], FD_MIGRATIONS);
   var rep: RcMigrationReport;
   var s: RcSession* = 0;
   var rc: int32 = fd_take(db, &s);
@@ -172,7 +183,8 @@ export fn fd_db_close(db: FdDb*) {
 
 // ---- users ----
 
-/// Inserts a user with no password yet (set it with ra_set_password).
+/// Inserts a user with no password yet (set it with ra_set_password) and the
+/// default quota.
 /// returns: FD_OK and *id; FD_E_EXISTS (name taken); FD_E_INVALID (bad name or role)
 export fn fd_user_create(db: FdDb*, username: string, role: string, id: int64*) -> int32 {
   if (!fd_name_ok(username) || !fd_name_ok(role)) { return FD_E_INVALID; }
@@ -184,6 +196,7 @@ export fn fd_user_create(db: FdDb*, username: string, role: string, id: int64*) 
   u.username = username;
   u.password_hash = "";
   u.role = role;
+  u.quota = FD_DEFAULT_QUOTA;
   var e: RcEntity = rc_entity_new(fd_user_meta(), (rawptr)&u);
   rc = fd_rc(rc_repo_insert(s, 0, &e));
   if (rc == FD_OK && id != 0) { *id = u.id; }
@@ -262,6 +275,23 @@ export fn fd_user_set_role(db: FdDb*, username: string, role: string) -> int32 {
   return rc;
 }
 
+/// Sets the bytes a user may store (> 0). returns FD_OK, FD_E_NOT_FOUND, FD_E_INVALID.
+export fn fd_user_set_quota(db: FdDb*, username: string, bytes: int64) -> int32 {
+  if (!fd_name_ok(username) || bytes <= 0) { return FD_E_INVALID; }
+  var s: RcSession* = 0;
+  var rc: int32 = fd_take(db, &s);
+  if (rc != FD_OK) { return rc; }
+  var q: RcQuery = rc_query_update_all(fd_user_meta());
+  rc_query_set(&q, "quota", RcInt(bytes));
+  rc_query_where(&q, "username", RC_CMP_EQ, RcText(username));
+  var n: int32 = 0;
+  rc = fd_rc(rc_repo_update_all(s, &q, &n));
+  rc_query_free(&q);
+  if (rc == FD_OK && n == 0) { rc = FD_E_NOT_FOUND; }
+  fd_give(db, s);
+  return rc;
+}
+
 /// Deletes a user. returns FD_OK, FD_E_NOT_FOUND.
 export fn fd_user_delete(db: FdDb*, username: string) -> int32 {
   if (username.length == 0) { return FD_E_USAGE; }
@@ -316,7 +346,7 @@ export fn fd_role_get(db: FdDb*, name: string, out: FdRoleInfo*) -> int32 {
   return rc;
 }
 
-/// Creates a role, or replaces its verb list.
+/// Creates a role (with the default max_file), or replaces its verb list.
 /// returns FD_OK, FD_E_INVALID (bad name, or a list over FD_COMMANDS_MAX)
 export fn fd_role_set(db: FdDb*, name: string, commands: string) -> int32 {
   if (!fd_name_ok(name) || (int64)commands.length > (int64)FD_COMMANDS_MAX) { return FD_E_INVALID; }
@@ -330,6 +360,7 @@ export fn fd_role_set(db: FdDb*, name: string, commands: string) -> int32 {
     memset((rawptr)&r, 0, (int64)sizeof(FdRole));
     r.name = name;
     r.commands = commands;
+    r.max_file = FD_DEFAULT_MAX_FILE;
     var e: RcEntity = rc_entity_new(fd_role_meta(), (rawptr)&r);
     rc = fd_rc(rc_repo_insert(s, 0, &e));
     fd_give(db, s);
@@ -344,6 +375,23 @@ export fn fd_role_set(db: FdDb*, name: string, commands: string) -> int32 {
   var n: int32 = 0;
   rc = fd_rc(rc_repo_update_all(s, &q, &n));
   rc_query_free(&q);
+  fd_give(db, s);
+  return rc;
+}
+
+/// Sets the largest upload a role allows (> 0). returns FD_OK, FD_E_NOT_FOUND, FD_E_INVALID.
+export fn fd_role_set_max_file(db: FdDb*, name: string, bytes: int64) -> int32 {
+  if (!fd_name_ok(name) || bytes <= 0) { return FD_E_INVALID; }
+  var s: RcSession* = 0;
+  var rc: int32 = fd_take(db, &s);
+  if (rc != FD_OK) { return rc; }
+  var q: RcQuery = rc_query_update_all(fd_role_meta());
+  rc_query_set(&q, "max_file", RcInt(bytes));
+  rc_query_where(&q, "name", RC_CMP_EQ, RcText(name));
+  var n: int32 = 0;
+  rc = fd_rc(rc_repo_update_all(s, &q, &n));
+  rc_query_free(&q);
+  if (rc == FD_OK && n == 0) { rc = FD_E_NOT_FOUND; }
   fd_give(db, s);
   return rc;
 }
@@ -391,12 +439,16 @@ export fn fd_role_list(db: FdDb*, out: FdRoleInfo*, cap: int32, n: int32*) -> in
   return rc;
 }
 
-/// Creates the default roles when missing: admin = "*", guest = the guest
-/// verb list. Existing roles are left as they are.
+/// Creates the default roles when missing: admin = "*" (max_file
+/// FD_ADMIN_MAX_FILE), guest = the guest verb list (the default max_file).
+/// Existing roles are left as they are.
 export fn fd_roles_seed(db: FdDb*) -> int32 {
   var probe: FdRoleInfo;
   var rc: int32 = fd_role_get(db, FD_ROLE_ADMIN, &probe);
-  if (rc == FD_E_NOT_FOUND) { rc = fd_role_set(db, FD_ROLE_ADMIN, FD_ADMIN_COMMANDS); }
+  if (rc == FD_E_NOT_FOUND) {
+    rc = fd_role_set(db, FD_ROLE_ADMIN, FD_ADMIN_COMMANDS);
+    if (rc == FD_OK) { rc = fd_role_set_max_file(db, FD_ROLE_ADMIN, FD_ADMIN_MAX_FILE); }
+  }
   if (rc != FD_OK) { return rc; }
   rc = fd_role_get(db, FD_ROLE_GUEST, &probe);
   if (rc == FD_E_NOT_FOUND) { rc = fd_role_set(db, FD_ROLE_GUEST, FD_GUEST_COMMANDS); }
@@ -439,6 +491,12 @@ export fn fd_system_reset(db: FdDb*) -> int32 {
 /// Adds a metadata entry. kind is FD_KIND_FILE or FD_KIND_DIR; owner a user name.
 /// returns FD_OK, FD_E_EXISTS (path taken), FD_E_INVALID.
 export fn fd_entry_add(db: FdDb*, path: string, kind: int32, size: int64, owner: string) -> int32 {
+  return fd_entry_add_hashed(db, path, kind, size, owner, "");
+}
+
+/// fd_entry_add with the SHA-256 of the file (64 lowercase hex digits, or "").
+export fn fd_entry_add_hashed(db: FdDb*, path: string, kind: int32, size: int64, owner: string,
+                              sha256: string) -> int32 {
   if (path.length == 0 || (int64)path.length > (int64)FD_PATH_MAX) { return FD_E_INVALID; }
   if (kind != FD_KIND_FILE && kind != FD_KIND_DIR) { return FD_E_INVALID; }
   if (size < 0 || !fd_name_ok(owner)) { return FD_E_INVALID; }
@@ -453,21 +511,23 @@ export fn fd_entry_add(db: FdDb*, path: string, kind: int32, size: int64, owner:
   m.owner = owner;
   m.created = time_unix();
   m.modified = m.created;
+  m.sha256 = sha256;
   var e: RcEntity = rc_entity_new(fd_entry_meta(), (rawptr)&m);
   rc = fd_rc(rc_repo_insert(s, 0, &e));
   fd_give(db, s);
   return rc;
 }
 
-/// Sets an entry's size and modified time (an upload over an existing file).
-/// returns FD_OK, FD_E_NOT_FOUND.
-export fn fd_entry_touch(db: FdDb*, path: string, size: int64) -> int32 {
+/// Sets an entry's size, hash ("" when unknown) and modified time (an upload
+/// over an existing file). returns FD_OK, FD_E_NOT_FOUND.
+export fn fd_entry_touch(db: FdDb*, path: string, size: int64, sha256: string) -> int32 {
   if (path.length == 0 || size < 0) { return FD_E_USAGE; }
   var s: RcSession* = 0;
   var rc: int32 = fd_take(db, &s);
   if (rc != FD_OK) { return rc; }
   var q: RcQuery = rc_query_update_all(fd_entry_meta());
   rc_query_set(&q, "size", RcInt(size));
+  rc_query_set(&q, "sha256", RcText(sha256));
   rc_query_set(&q, "modified", RcInt(time_unix()));
   rc_query_where(&q, "path", RC_CMP_EQ, RcText(path));
   var n: int32 = 0;
@@ -552,4 +612,32 @@ export fn fd_entry_list(db: FdDb*, prefix: string, out: FdEntryInfo*, cap: int32
 export fn fd_entry_list_owner(db: FdDb*, owner: string, out: FdEntryInfo*, cap: int32, n: int32*) -> int32 {
   if (owner.length == 0) { return FD_E_USAGE; }
   return fd_entry_scan(db, "", owner, out, cap, n);
+}
+
+/// Bytes of file data owned by `owner` (the sum of its file entries' sizes).
+export fn fd_entry_usage(db: FdDb*, owner: string, bytes: int64*) -> int32 {
+  if (owner.length == 0 || bytes == 0) { return FD_E_USAGE; }
+  *bytes = 0;
+  var s: RcSession* = 0;
+  var rc: int32 = fd_take(db, &s);
+  if (rc != FD_OK) { return rc; }
+  var q: RcQuery = rc_query_select(fd_entry_meta());
+  rc_query_where(&q, "owner", RC_CMP_EQ, RcText(owner));
+  var rows: RcRows;
+  rc = fd_rc(rc_repo_all(s, &q, &rows));
+  rc_query_free(&q);
+  if (rc == FD_OK) {
+    var total: int64 = 0;
+    var i: int32 = 0;
+    while (i < rows.n) {
+      var m: FdEntry;
+      var e: RcEntity;
+      if (rc_rows_get(&rows, i, (rawptr)&m, &e) != RC_OK) { rc = FD_E_DB; break; }
+      if (m.kind == FD_KIND_FILE && m.size > 0) { total = total + m.size; }
+      i = i + 1;
+    }
+    *bytes = total;
+  }
+  fd_give(db, s);
+  return rc;
 }

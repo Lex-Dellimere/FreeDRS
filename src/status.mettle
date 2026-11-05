@@ -25,6 +25,8 @@ export const FD_E_TRAVERSAL: int32 = -12;
 export const FD_E_IO: int32 = -13;
 /// Bigger than the configured limit.
 export const FD_E_TOO_BIG: int32 = -14;
+/// The user's quota would be passed.
+export const FD_E_QUOTA: int32 = -15;
 
 export fn fd_status_text(code: int32) -> string {
   if (code == FD_OK) { return "ok"; }
@@ -41,5 +43,6 @@ export fn fd_status_text(code: int32) -> string {
   if (code == FD_E_TRAVERSAL) { return "path traversal not allowed"; }
   if (code == FD_E_IO) { return "file I/O error"; }
   if (code == FD_E_TOO_BIG) { return "too large"; }
+  if (code == FD_E_QUOTA) { return "quota exceeded"; }
   return "unknown error";
 }

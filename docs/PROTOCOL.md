@@ -19,8 +19,8 @@ Line-based text over TCP (default port 5555), `\n`-terminated UTF-8. The server 
 | `myfiles` | `Your files:` + same lines (by clientId), or `You don't have any files.` |
 | `mkdir <p>` | `SUCCESS: Directory created: <path>` |
 | `delete <p>` | `SUCCESS: File deleted` / `ERROR: File not found` / `ERROR: Permission denied` (owner clientId mismatch and owner != `admin`) / `ERROR: Directory not empty` |
-| `upload <local> [remote]` | server: `READY: Send file data (base64 encoded). END with 'EOF' on a new line.` (no CMD_END yet); client sends the base64 data (one line) then line `EOF`; server then `SUCCESS: File uploaded: <entry>` or `ERROR: No file data received`, + `CMD_END`. Remote path defaults to basename of local; relative paths are joined to cwd; leading `/` stripped; `..` rejected (path traversal) |
-| `download <p>` | `FILE_DATA:`, one base64 line, `END_FILE`, then `SUCCESS: File sent`, `CMD_END`. Missing -> `ERROR: File not found: <p>` |
+| `upload [--lz4] [--resume] <local> [remote]` | `READY: <max-chunk-bytes>` (with ` lz4` when LZ4 is on), no CMD_END yet; then the transfer below. Remote path defaults to the basename of local; relative paths are joined to cwd; leading `/` stripped; `..` rejected (path traversal) |
+| `download [--lz4] <p> [offset]` | `FILE_DATA: <n>` (with ` lz4`), data lines, `END_FILE <sha256-hex>`, then `SUCCESS: File sent` and `CMD_END`. A last word of digits is the offset (send `0` for a path that ends in a number). Missing -> `ERROR: File not found: <p>` |
 | `whoami` | `You are client #<id> (<user>)` |
 | `help` | `Available Commands:` / `====` + role's command list (or `All commands available (admin)`) + examples |
 | `refresh` | `SUCCESS: File system metadata reloaded` |
@@ -31,14 +31,22 @@ Line-based text over TCP (default port 5555), `\n`-terminated UTF-8. The server 
 | `setrole <user> <role>` | `SUCCESS: Role updated for <user>` / `ERROR: User not found` |
 | `listroles` | comma-joined role names |
 | `createrole <role> <cmd,cmd,..>` / `deleterole <role>` | `SUCCESS: Role created/updated` / `SUCCESS: Role deleted` |
+| `setquota <user> <bytes>` / `setmaxfile <role> <bytes>` | `SUCCESS: Quota updated for <user>` / `SUCCESS: Max file size updated for <role>` (`ERROR: User not found`, `ERROR: Role not found`) |
 | `deleteuser <u>` / `renameuser <old> <new>` | `SUCCESS: User deleted` (`ERROR: User not found`) / `SUCCESS: User renamed` (`ERROR: Failed to rename user (may already exist)`) |
 | `resetsystem` | wipes users+roles, re-seeds roles, reloads VFS: `SUCCESS: System reset complete` |
 | `shutdown` | `SUCCESS: Server shutting down`; process exits after 500 ms |
 
-**Roles.** Table `roles(name, commands)`; commands is comma-separated verbs, `*` = all. Seeded: `admin = *`, `guest = list,pwd,cd,help,whoami,quit,exit`. Unknown role falls back to the guest set. Roles are checked by verb only. Users table: `users(id, username UNIQUE, password_hash, role)`.
+**Roles.** Table `roles(name, commands, max_file)`; commands is comma-separated verbs, `*` = all. Seeded: `admin = *`, `guest = list,pwd,cd,help,whoami,quit,exit`. Unknown role falls back to the guest set. Roles are checked by verb only. Users table: `users(id, username UNIQUE, password_hash, role, quota)`. `max_file` is the largest upload the role allows and `quota` the bytes a user may store (the sizes of the files they own); 0 means the default (4 GiB, 10 GiB). Setup gives the admin role and the admin user 1 TiB each. File entries keep the SHA-256 of their bytes.
+
+**Streaming transfers.** A data line is the base64 (standard alphabet, with padding) of at most `max-chunk-bytes` (65536) raw bytes. Every line but the last carries a multiple of 3 bytes, so each decodes on its own. With LZ4 each line is instead one LZ4 frame (Press, level 1) of at most 65536 compressed bytes that inflates to at most 65536 bytes, again a multiple of 3 except the last.
+
+- Upload: after `READY`, the client sends `SIZE <n>`. The server checks the role's `max_file` and the user's quota (stored bytes, less the file being replaced if it is theirs, plus their other uploads in progress) before any data, and answers `OFFSET <k>` or `ERROR: File too large: ...` / `ERROR: Quota exceeded: ...` and `CMD_END`. Then the data lines from byte k, then `EOF <sha256-hex>` (the hash of the whole file). Answer: `SUCCESS: File uploaded: <entry>` or `ERROR: Hash mismatch, upload discarded`, then `CMD_END`. The server writes into a temp file and renames it into place only after the hash matches and the file is synced.
+- `--resume`: when the user has a partial upload of the same path and size (a connection that broke after some data), `OFFSET` gives where it stopped and the client goes on from there. Partial uploads are kept for 24 hours and are lost when the server restarts. Without `--resume` a new upload replaces the partial one.
+- Download: `FILE_DATA: <n>` gives the bytes that follow (file size minus offset); `END_FILE` carries the SHA-256 of the whole file (the stored one when there is one). A read error ends the data with an `ERROR:` line and `CMD_END`. `ERROR: The stored file does not match its hash` after `END_FILE` means the server's copy is damaged.
+- Bad input ends the session after `ERROR: <why>` and `CMD_END`: a missing or malformed `SIZE`, bad base64, a line over 87384 characters or with more than 65536 bytes, a short line that is not the last, data beyond `SIZE`, an LZ4 line that is not a valid frame or inflates past 65536 bytes. A transfer with no progress for 60 s ends with `ERROR: Transfer timed out` and the connection closes.
 
 
 **Other replies.**
 - Auth: `ERROR: Invalid username or password (password needs 8 or more characters)` on signup with a short password, and `ERROR: Too many failed logins. Try again later` once lockout kicks in.
-- Limits: `ERROR: Line too long`, `ERROR: Server full` (refused at connect) and `ERROR: Server busy, try again` (the request could not be processed).
-- Files: `ERROR: Invalid path` for paths that leave the root and `ERROR: Already exists: <path>` when `mkdir` targets an existing entry.
+- Limits: `ERROR: Line too long` (over 128 KiB; the session closes), `ERROR: Server full` (refused at connect) and `ERROR: Server busy, try again` (the request could not be processed).
+- Files: `ERROR: Invalid path` for paths that leave the root or name the server's temp directory `.freedrs-tmp`, and `ERROR: Already exists: <path>` when `mkdir` targets an existing entry.
