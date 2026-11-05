@@ -32,6 +32,7 @@ import "std/conv";
 import "std/arena";
 import "std/strbuf";
 import "alph/alph";
+import "log/log";
 import "mtls/mtls";
 import "freedrs/status";
 import "freedrs/auth/auth";
@@ -81,6 +82,7 @@ struct FdSession {
   tls: MtlsConn*;      // the TLS connection, or 0 for plain TCP
   tls_ready: bool;     // the handshake is done and the greeting queued
   tls_closed: bool;    // close_notify is queued
+  why: string;         // how the session ended, for the log
 }
 
 // ---- output ----
@@ -184,12 +186,29 @@ fn net_read(st: FdSession*, buf: rawptr, cap: int64) -> int64 {
     var n: int64 = mtls_conn_read(st->tls, (uint8*)buf, cap);
     tls_drain(st);   // alerts and key updates the read produced
     if (n > 0 || n == 0) { return n; }
-    if (n != (int64)MTLS_E_WANT_IO) { return -1; }   // the connection failed; the alert is queued
+    if (n != (int64)MTLS_E_WANT_IO) {   // the connection failed; the alert is queued
+      var why: string = mtls_err_text(mtls_conn_error(st->tls));
+      if (st->tls_ready) {
+        log_warn(fd_log(), "TLS error", log_int("session", st->ctx->self), log_str("error", why));
+        st->why = "TLS error";
+      } else {
+        log_warn(fd_log(), "TLS handshake failed", log_int("session", st->ctx->self), log_str("error", why));
+        st->why = "TLS handshake failed";
+      }
+      return -1;
+    }
     var p: uint8* = (uint8*)0;
     var room: int64 = mtls_conn_in_space(st->tls, &p);
     if (room <= 0) { return -1; }
     var r: int64 = alph_io_read(st->ctx, st->h, (rawptr)p, room);
-    if (r == ALPH_IO_AGAIN || r <= 0) { return r; }
+    if (r == ALPH_IO_AGAIN) { return r; }
+    if (r <= 0) {
+      if (!st->tls_ready) {
+        log_warn(fd_log(), "TLS handshake failed, client left", log_int("session", st->ctx->self));
+        st->why = "TLS handshake failed";
+      }
+      return r;
+    }
     mtls_conn_in_commit(st->tls, r);
     tls_drain(st);
     if (!st->tls_ready && !mtls_conn_handshaking(st->tls) && mtls_conn_error(st->tls) == 0) {
@@ -207,14 +226,19 @@ fn is_word(s: string, lower: string) -> bool {
   return fd_lower(s, &buf[0], 16) == lower;
 }
 
-fn complete_login(st: FdSession*, welcome: string) {
+fn complete_login(st: FdSession*, welcome: string, how: string) {
   var id: int64 = fd_clients_register(st->ctx->self, fd_user_info_name(&st->sess.user),
                                       fd_user_info_role(&st->sess.user));
   if (id == 0) {
+    log_warn(fd_log(), "login refused, server full", log_int("session", st->ctx->self),
+             log_str("user", fd_user_info_name(&st->sess.user)));
     out_str(st, "ERROR: Server full\n");
+    st->why = "server full";
     st->closing = true;
     return;
   }
+  log_info(fd_log(), how, log_int("session", st->ctx->self), log_int("client", id),
+           log_str("user", fd_user_info_name(&st->sess.user)), log_str("role", fd_user_info_role(&st->sess.user)));
   st->sess.client_id = id;
   st->registered = true;
   st->mode = MODE_CMD;
@@ -228,7 +252,9 @@ fn db_error(st: FdSession*, rc: int32) {
   out_str(st, "\n");
 }
 
-fn busy_error(st: FdSession*, kind: int32) {
+fn busy_error(st: FdSession*, kind: int32, why: string) {
+  log_warn(fd_log(), "server busy", log_int("session", st->ctx->self), log_int("client", st->sess.client_id),
+           log_int("job", kind), log_str("why", why));
   if (kind == JOB_LOGIN || kind == JOB_SIGNUP) {
     out_str(st, "ERROR: Server busy, try again\n");
   } else {
@@ -246,12 +272,12 @@ fn submit(st: FdSession*, ji: FdJobIn*, text: rawptr, text_len: int64, whole: bo
   var total: int64 = hdr + text_len;
   if (!whole) {
     block = alph_scratch(st->ctx, total);
-    if (block == 0) { busy_error(st, ji->kind); return; }
+    if (block == 0) { busy_error(st, ji->kind, "no memory"); return; }
     memcpy(block, (rawptr)ji, hdr);
     if (text_len > 0) { memcpy((rawptr)((uint8*)block + hdr), text, text_len); }
   }
   var ref: int64 = alph_offload(st->ctx, st->pool, block, total, JOB_TIMEOUT_MS, &fd_job_run);
-  if (ref <= 0) { busy_error(st, ji->kind); return; }   // pool full or no memory
+  if (ref <= 0) { busy_error(st, ji->kind, "job not queued"); return; }   // pool full or no memory
   st->job = ref;
   st->job_kind = ji->kind;
 }
@@ -260,8 +286,12 @@ fn handle_auth(st: FdSession*, line: string) {
   var t: string = str_trim(line);
   if (t.length == 0) { return; }
   if (is_word(t, "guest")) {
-    if (fd_auth_guest(&st->sess.user) != FD_OK) { db_error(st, FD_E_CRYPTO); return; }
-    complete_login(st, "SUCCESS: Logged in as GUEST\n");
+    if (fd_auth_guest(&st->sess.user) != FD_OK) {
+      log_error(fd_log(), "guest login failed", log_int("session", st->ctx->self));
+      db_error(st, FD_E_CRYPTO);
+      return;
+    }
+    complete_login(st, "SUCCESS: Logged in as GUEST\n", "guest login");
     return;
   }
   var w: FdWords = fd_next_word(t);
@@ -278,7 +308,7 @@ fn handle_auth(st: FdSession*, line: string) {
   var un: int64 = (int64)u.word.length;
   var pn: int64 = (int64)u.rest.length;
   var buf: rawptr = alph_scratch(st->ctx, un + pn);
-  if (buf == 0) { busy_error(st, kind); return; }
+  if (buf == 0) { busy_error(st, kind, "no memory"); return; }
   memcpy(buf, (rawptr)u.word.chars, un);
   memcpy((rawptr)((uint8*)buf + un), (rawptr)u.rest.chars, pn);
   var ji: FdJobIn;
@@ -302,7 +332,7 @@ fn auth_done(st: FdSession*, o: FdJobOut*) {
       strbuf_append_string(sb, " [");
       strbuf_append_string(sb, fd_user_info_role(&st->sess.user));
       strbuf_append_string(sb, "]\n");
-      complete_login(st, strbuf_finish_string(sb));
+      complete_login(st, strbuf_finish_string(sb), "login");
       arena_free(a);
     } else if (rc == FD_E_DENIED || rc == FD_E_INVALID || rc == FD_E_NOT_FOUND) {
       out_str(st, "ERROR: Invalid username or password\n");
@@ -343,7 +373,7 @@ fn run_command(st: FdSession*, line: string) {
 fn finish_upload(st: FdSession*) {
   if (st->up == 0) {   // an empty upload: the header alone
     st->up = (uint8*)alph_alloc(st->ctx, up_hdr());
-    if (st->up == 0) { busy_error(st, JOB_UPLOAD); return; }
+    if (st->up == 0) { busy_error(st, JOB_UPLOAD, "no memory"); return; }
     st->up_cap = up_hdr();
   }
   var ji: FdJobIn* = (FdJobIn*)st->up;
@@ -362,7 +392,7 @@ fn finish_upload(st: FdSession*) {
 // The answer to a command or upload job: the reply, then what the command asked for.
 fn command_done(st: FdSession*, o: FdJobOut*, size: int64) {
   var hdr: int64 = (int64)sizeof(FdJobOut);
-  if (size < hdr + o->reply_len + o->bulk_len) { busy_error(st, JOB_CMD); return; }
+  if (size < hdr + o->reply_len + o->bulk_len) { busy_error(st, JOB_CMD, "short result"); return; }
   memcpy((rawptr)&st->sess, (rawptr)&o->sess, (int64)sizeof(FdSess));
   var reply: uint8* = (uint8*)o + hdr;
   out_put(st, (rawptr)reply, o->reply_len);
@@ -379,16 +409,17 @@ fn command_done(st: FdSession*, o: FdJobOut*, size: int64) {
     out_str(st, FD_DOWNLOAD_TAIL);
   }
   out_str(st, "CMD_END\n");
-  if (act == FD_ACT_QUIT) { st->closing = true; }
+  if (act == FD_ACT_QUIT) { st->why = "quit"; st->closing = true; }
   if (act == FD_ACT_KICK) {
     var c: FdClient;
     if (st->sess.act_arg == st->sess.client_id) {
+      st->why = "kicked (self)";
       st->closing = true;
     } else if (fd_clients_find(st->sess.act_arg, &c)) {
       alph_send(st->ctx, c.pid, TAG_KICK, 0);   // it ends itself
     }
   }
-  if (act == FD_ACT_SHUTDOWN) { st->shutting = true; }   // acted on once the reply is written
+  if (act == FD_ACT_SHUTDOWN) { st->why = "server shutdown"; st->shutting = true; }   // acted on once the reply is written
 }
 
 // Bytes before the upload data in st->up: room for the job header.
@@ -427,6 +458,14 @@ fn handle_line(st: FdSession*, line: string) {
 
 // Ends the session: unregisters it; the runtime frees the heap and closes the handle.
 fn end_session(ctx: AlphCtx*, st: FdSession*) -> int64 {
+  var why: string = st->why;
+  if (why.length == 0) { why = "closed by client"; }
+  if (st->registered) {
+    log_info(fd_log(), "client disconnected", log_int("session", ctx->self), log_int("client", st->sess.client_id),
+             log_str("user", fd_user_info_name(&st->sess.user)), log_str("why", why));
+  } else {
+    log_info(fd_log(), "client disconnected", log_int("session", ctx->self), log_str("why", why));
+  }
   if (st->registered) { fd_clients_unregister(st->sess.client_id); st->registered = false; }
   if (st->tls != (MtlsConn*)0) { mtls_conn_free(st->tls); st->tls = (MtlsConn*)0; }
   return alph_stop(ctx, ALPH_NORMAL);
@@ -436,7 +475,13 @@ fn end_session(ctx: AlphCtx*, st: FdSession*) -> int64 {
 // otherwise arms the handle again: for input unless a job is out (the answer
 // comes as a message, and the next line waits for it), for output while some is waiting.
 fn settle(ctx: AlphCtx*, st: FdSession*) -> int64 {
-  if (st->broken) { return end_session(ctx, st); }
+  if (st->broken) {
+    if (st->why.length == 0) {
+      log_error(fd_log(), "cannot queue output", log_int("session", ctx->self), log_int("client", st->sess.client_id));
+      st->why = "output failed";
+    }
+    return end_session(ctx, st);
+  }
   if (st->tls != (MtlsConn*)0 && st->closing && st->job == 0 && !st->tls_closed) {
     st->tls_closed = true;
     mtls_conn_close(st->tls);   // close_notify
@@ -444,7 +489,12 @@ fn settle(ctx: AlphCtx*, st: FdSession*) -> int64 {
     if (st->broken) { return end_session(ctx, st); }
   }
   var left: int64 = alph_outq_flush(ctx, &st->out, st->h);
-  if (left < 0) { return end_session(ctx, st); }
+  if (left < 0) {
+    log_error(fd_log(), "write failed", log_int("session", ctx->self), log_int("client", st->sess.client_id),
+              log_int("errno", -left));
+    st->why = "write failed";
+    return end_session(ctx, st);
+  }
   if (st->shutting) {
     st->shutting = false;
     alph_shutdown(ctx, 500, 0);   // the reply was queued first; flushed above
@@ -477,13 +527,23 @@ fn read_input(st: FdSession*) {
       return;
     }
     if (!make_room(st)) {
+      log_warn(fd_log(), "line too long", log_int("session", st->ctx->self), log_int("client", st->sess.client_id));
       out_str(st, "ERROR: Line too long\n");
+      st->why = "line too long";
       st->closing = true;
       return;
     }
     var n: int64 = net_read(st, (rawptr)(st->rbuf + st->rlen), st->rcap - st->rlen);
     if (n == ALPH_IO_AGAIN) { return; }
-    if (n <= 0) { st->closing = true; return; }   // closed or failed: leave once the output is out
+    if (n <= 0) {   // closed or failed: leave once the output is out
+      if (n < 0 && st->why.length == 0) {
+        log_error(fd_log(), "read failed", log_int("session", st->ctx->self), log_int("client", st->sess.client_id),
+                  log_int("errno", -n));
+        st->why = "read failed";
+      }
+      st->closing = true;
+      return;
+    }
     st->rlen = st->rlen + n;
     reads = reads + 1;
   }
@@ -496,7 +556,13 @@ fn job_answer(st: FdSession*, m: AlphMsg*) {
   var size: int64 = 0;
   var data: rawptr = alph_msg_bytes(m, &size);
   if (m->tag != ALPH_TAG_DONE || m->arg != 0 || size < (int64)sizeof(FdJobOut)) {
-    busy_error(st, kind);
+    if (m->tag == ALPH_TAG_TIMEOUT) {
+      busy_error(st, kind, "job timed out");
+    } else {
+      log_error(fd_log(), "job failed", log_int("session", st->ctx->self), log_int("client", st->sess.client_id),
+                log_int("job", kind), log_int("tag", m->tag), log_int("arg", m->arg));
+      busy_error(st, kind, "job failed");
+    }
     return;
   }
   if (kind == JOB_LOGIN || kind == JOB_SIGNUP) { auth_done(st, (FdJobOut*)data); }
@@ -514,12 +580,19 @@ export fn fd_session_actor(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
     st->mode = MODE_AUTH;
     alph_outq_init(&st->out, OUT_LIMIT);
     st->rbuf = (uint8*)alph_alloc(ctx, RBUF_START);
-    if (st->rbuf == 0) { return end_session(ctx, st); }
+    if (st->rbuf == 0) {
+      log_error(fd_log(), "no memory for a client", log_int("session", ctx->self));
+      st->why = "no memory";
+      return end_session(ctx, st);
+    }
     st->rcap = RBUF_START;
     alph_tcp_nodelay(ctx, st->h, true);
+    log_info(fd_log(), "client connected", log_int("session", ctx->self), log_bool("tls", g_tls_on));
     if (g_tls_on) {
       st->tls = mtls_server_new(&g_tls_cfg);   // the greeting follows the handshake
       if (st->tls == (MtlsConn*)0) {
+        log_error(fd_log(), "cannot start TLS for a client", log_int("session", ctx->self));
+        st->why = "TLS setup failed";
         return end_session(ctx, st);
       }
     } else {
@@ -528,7 +601,7 @@ export fn fd_session_actor(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
     return settle(ctx, st);
   }
   if (st->h == 0) { return ALPH_CONTINUE; }   // INIT: the handle has not arrived yet
-  if (m->tag == TAG_KICK) { return end_session(ctx, st); }
+  if (m->tag == TAG_KICK) { st->why = "kicked"; return end_session(ctx, st); }
   if (m->tag == TAG_MORE) {
     read_input(st);
     return settle(ctx, st);

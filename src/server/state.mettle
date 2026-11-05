@@ -35,8 +35,9 @@ export fn fd_log_init() {
   if (g_log == (LogLogger*)0) { g_log = log_logger("freedrs"); }
 }
 
-/// The server's logger (set up by fd_log_init).
+/// The server's logger (set up by fd_log_init; the root logger before that).
 export fn fd_log() -> LogLogger* {
+  if (g_log == (LogLogger*)0) { return log_root(); }
   return g_log;
 }
 
@@ -107,15 +108,23 @@ export fn fd_clients_unregister(id: int64) {
 }
 
 /// Removes the session of this actor (the acceptor does this when a session
-/// actor dies without unregistering itself, e.g. a crash). Unknown pids are ignored.
-export fn fd_clients_unregister_pid(pid: int64) {
+/// actor dies without unregistering itself, e.g. a crash) and copies it into
+/// out. returns false for an unknown pid.
+export fn fd_clients_unregister_pid(pid: int64, out: FdClient*) -> bool {
+  var found: bool = false;
   sync_mutex_lock(&g_clients_lock);
   var i: int32 = 0;
   while (i < FD_MAX_CLIENTS) {
-    if (g_clients[i].used && g_clients[i].pid == pid) { g_clients[i].used = false; break; }
+    if (g_clients[i].used && g_clients[i].pid == pid) {
+      memcpy((rawptr)out, (rawptr)&g_clients[i], (int64)sizeof(FdClient));
+      g_clients[i].used = false;
+      found = true;
+      break;
+    }
     i = i + 1;
   }
   sync_mutex_unlock(&g_clients_lock);
+  return found;
 }
 
 /// Copies the session with this id into out. returns false when none.

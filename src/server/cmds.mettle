@@ -17,6 +17,7 @@ import "std/strbuf";
 import "std/encoding";
 import "std/fs";
 import "sysinfo";
+import "log/log";
 import "freedrs/status";
 import "freedrs/config/config";
 import "freedrs/auth/roles";
@@ -395,6 +396,8 @@ fn cmd_kick(s: FdSess*, args: string, b: StrBuf*) {
   if (!fd_clients_find(id, &c)) { ln(b, "ERROR: Client not found"); return; }
   s->action = FD_ACT_KICK;
   s->act_arg = id;
+  log_info(fd_log(), "kick", log_int("client", s->client_id), log_str("user", fd_user_info_name(&s->user)),
+           log_int("target", id), log_str("target_user", fd_client_user(&c)));
   put(b, "SUCCESS: Client #");
   strbuf_append_int(b, id);
   ln(b, " kicked.");
@@ -588,6 +591,9 @@ export fn fd_cmd_run(s: FdSess*, line: string, b: StrBuf*, a: Arena*) {
   var args: string = w.rest;
   if (verb == "ping") { ln(b, "PONG"); return; }
   if (!fd_can(&g_db, &s->user, verb)) {
+    log_warn(fd_log(), "permission denied", log_int("client", s->client_id),
+             log_str("user", fd_user_info_name(&s->user)), log_str("role", fd_user_info_role(&s->user)),
+             log_str("command", verb));
     ln(b, "ERROR: Permission denied. Your role does not allow this command.");
     return;
   }
@@ -619,7 +625,11 @@ export fn fd_cmd_run(s: FdSess*, line: string, b: StrBuf*, a: Arena*) {
   else if (verb == "deleteuser") { cmd_deleteuser(args, b); }
   else if (verb == "renameuser") { cmd_renameuser(args, b); }
   else if (verb == "resetsystem") { cmd_resetsystem(b); }
-  else if (verb == "shutdown") { ln(b, "SUCCESS: Server shutting down"); s->action = FD_ACT_SHUTDOWN; }
+  else if (verb == "shutdown") {
+    log_info(fd_log(), "shutdown requested", log_int("client", s->client_id), log_str("user", fd_user_info_name(&s->user)));
+    ln(b, "SUCCESS: Server shutting down");
+    s->action = FD_ACT_SHUTDOWN;
+  }
   else if (verb == "quit" || verb == "exit") { ln(b, "Goodbye!"); s->action = FD_ACT_QUIT; }
   else { ln(b, "ERROR: Unknown command. Type 'help' for available commands."); }
 }

@@ -19,6 +19,7 @@
 import "std/mem";
 import "std/thread";
 import "alph/alph";
+import "log/log";
 import "freedrs/db/store";
 import "freedrs/server/state";
 import "freedrs/server/session";
@@ -49,7 +50,10 @@ fn accept_next(ctx: AlphCtx*, a: Acceptor*) {
       a->waiting = h;
       return;
     }
+    log_warn(fd_log(), "connection refused, cannot start a session", log_int("code", a->asking));
     alph_io_close(ctx, h);   // the request was not sent
+  } else if (h != ALPH_IO_AGAIN) {
+    log_error(fd_log(), "accept failed", log_int("errno", -h));
   }
   alph_io_arm(ctx, a->listener, ALPH_IO_IN);
 }
@@ -82,14 +86,27 @@ fn acceptor(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
       given = alph_io_give(ctx, a->waiting, m->arg);
       if (given == ALPH_SENT) { alph_monitor(ctx, m->arg); }
     }
-    if (given != ALPH_SENT) { alph_io_close(ctx, a->waiting); }
+    if (given != ALPH_SENT) {
+      log_warn(fd_log(), "connection dropped, no session took it", log_int("tag", m->tag), log_int("arg", m->arg));
+      alph_io_close(ctx, a->waiting);
+    }
     a->asking = 0;
     a->waiting = 0;
     accept_next(ctx, a);
     return ALPH_CONTINUE;
   }
   if (m->tag == ALPH_TAG_DOWN) {
-    fd_clients_unregister_pid(m->from);   // a session ended (a normal end unregistered already)
+    // A session ended (a normal end unregistered already).
+    var c: FdClient;
+    var known: bool = fd_clients_unregister_pid(m->from, &c);
+    if (m->arg != ALPH_NORMAL && m->arg != ALPH_SHUTDOWN) {
+      if (known) {
+        log_error(fd_log(), "session crashed", log_int("session", m->from), log_int("client", c.id),
+                  log_str("user", fd_client_user(&c)), log_int("reason", m->arg));
+      } else {
+        log_error(fd_log(), "session crashed", log_int("session", m->from), log_int("reason", m->arg));
+      }
+    }
   }
   return ALPH_CONTINUE;
 }
