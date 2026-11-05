@@ -1,8 +1,10 @@
 // tests/config_tests: server_config.json parsing with the registry json
-// reader (@test functions, run by `mbuild test` in the interpreter). Reading
-// the file from disk is not tested; only parsing is.
+// reader and writing with the codec JSON writer (@test functions, run by
+// `mbuild test` in the interpreter). Saving to and loading from disk is in
+// config_save_test.mettle.
 
 import "std/conv";
+import "codec/json/write";
 import "freedrs/status";
 import "freedrs/config/config";
 
@@ -83,5 +85,40 @@ import "freedrs/config/config";
   if (fd_config_set_meodb(&c, "") != FD_E_INVALID) { return 1; }
   if (fd_config_set_meodb(&c, "127.0.0.1:9999") != FD_OK) { return 2; }
   if (fd_config_meodb(&c) != "127.0.0.1:9999") { return 3; }
+  return 0;
+}
+
+@test fn t_config_json_round_trip() -> int32 {
+  var c: FdConfig;
+  fd_config_defaults(&c);
+  if (fd_config_set_port(&c, 6123) != FD_OK) { return 1; }
+  if (fd_config_set_root(&c, "/srv/dfs \"quoted\" \\ data") != FD_OK) { return 2; }
+  if (fd_config_set_meodb(&c, "10.1.2.3:5490") != FD_OK) { return 3; }
+  if (fd_config_set_admin_user(&c, "boss") != FD_OK) { return 4; }
+  var b: CodecBuf;
+  codec_buf_init(&b, 256);
+  if (fd_config_to_json(&c, &b) != FD_OK) { return 5; }
+  var back: FdConfig;
+  fd_config_defaults(&back);
+  var rc: int32 = fd_config_parse(&back, codec_buf_view(&b));
+  codec_buf_free(&b);
+  if (rc != FD_OK) { return 6; }
+  if (back.port != 6123) { return 7; }
+  if (fd_config_root(&back) != "/srv/dfs \"quoted\" \\ data") { return 8; }
+  if (fd_config_meodb(&back) != "10.1.2.3:5490") { return 9; }
+  if (fd_config_admin_user(&back) != "boss") { return 10; }
+  return 0;
+}
+
+@test fn t_config_json_text() -> int32 {
+  var c: FdConfig;
+  fd_config_defaults(&c);
+  var b: CodecBuf;
+  codec_buf_init(&b, 256);
+  if (fd_config_to_json(&c, &b) != FD_OK) { return 1; }
+  var doc: string = codec_buf_view(&b);
+  var ok: bool = str_contains(doc, "\"port\": 5555") != 0 && str_contains(doc, "\"resourcesPath\": \"dfs_root\"") != 0;
+  codec_buf_free(&b);
+  if (!ok) { return 2; }
   return 0;
 }

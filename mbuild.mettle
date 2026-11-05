@@ -15,7 +15,7 @@ fn project() {
   mb_import_root("src");
   mb_targets("linux");
 
-  // The setup tool: default roles and the admin user.
+  // The setup tool: writes server_config.json, then creates the default roles and the admin user.
   mb_bin("freedrs_setup", "src/setup/main.mettle");
   // The server (alph: an acceptor actor and one session actor per client).
   mb_bin("freedrs_server", "src/server/main.mettle");
@@ -44,5 +44,10 @@ fn deps() {
   mb_dep_path("raize_auth", "../raize_auth");
   mb_dep_path("crypto", "../cryptex");
   mb_dep_path("alph", "../alph");
+  mb_dep_path("codec", "../codec");
+  mb_dep_path("args", "../args");
+  mb_dep_path("log", "../log");
+  mb_dep_path("sysinfo", "../sysinfo");
+  mb_dep_path("mtls", "../mtls");
   mb_dep_bin("meodb", "meodb");
 }

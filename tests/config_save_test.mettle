@@ -1,0 +1,63 @@
+// tests/config_save_test: fd_config_save and fd_config_load on real files.
+// A test program: `mbuild test config_save`.
+
+import "std/io";
+import "std/file";
+import "freedrs/status";
+import "freedrs/config/config";
+
+var g_failed: int32 = 0;
+
+fn check(name: string, ok: bool) {
+  if (!ok) {
+    g_failed = g_failed + 1;
+    println("FAIL {name}");
+  }
+}
+
+fn exists(path: string) -> bool {
+  var fd: int64 = file_open(path, FILE_READ);
+  if (fd < 0) { return false; }
+  file_close(fd);
+  return true;
+}
+
+fn main() -> int32 {
+  var path: string = ".mbuild/test_server_config.json";
+  file_remove(path);
+
+  // what the setup tool saves, the server loads
+  var c: FdConfig;
+  fd_config_defaults(&c);
+  check("set port", fd_config_set_port(&c, 6123) == FD_OK);
+  check("set root", fd_config_set_root(&c, "/srv/dfs \"quoted\" \\ data") == FD_OK);
+  check("set meodb", fd_config_set_meodb(&c, "10.1.2.3:5490") == FD_OK);
+  check("set admin", fd_config_set_admin_user(&c, "boss") == FD_OK);
+  check("save", fd_config_save(&c, path) == FD_OK);
+  var back: FdConfig;
+  fd_config_defaults(&back);
+  check("load", fd_config_load(&back, path) == FD_OK);
+  check("port", back.port == 6123);
+  check("root", fd_config_root(&back) == "/srv/dfs \"quoted\" \\ data");
+  check("meodb", fd_config_meodb(&back) == "10.1.2.3:5490");
+  check("admin", fd_config_admin_user(&back) == "boss");
+
+  // saving again replaces the file and leaves no temporary file
+  fd_config_set_port(&c, 7001);
+  check("save again", fd_config_save(&c, path) == FD_OK);
+  fd_config_defaults(&back);
+  check("load again", fd_config_load(&back, path) == FD_OK && back.port == 7001);
+  check("no temp file", !exists(path + ".tmp"));
+  file_remove(path);
+
+  // a failed save keeps the old file
+  check("save to missing dir", fd_config_save(&c, ".mbuild/no_such_dir/x.json") == FD_E_IO);
+  check("empty path", fd_config_save(&c, "") == FD_E_USAGE);
+
+  if (g_failed > 0) {
+    println("FAIL config_save_test: {g_failed} checks failed");
+    return 1;
+  }
+  println("PASS config_save_test");
+  return 0;
+}

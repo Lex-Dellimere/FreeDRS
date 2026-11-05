@@ -3,5 +3,6 @@
 /mettle.deps
 /mbuild.local.mettle
 /dfs_root/
+/server_config.json
 /run/
 *.meo

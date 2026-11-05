@@ -14,6 +14,12 @@
 // `kick` sends the target session actor a TAG_KICK message (state.mettle keeps
 // the pid); it ends itself. `shutdown` asks the node to stop in order.
 //
+// With TLS on (g_tls_on) the session runs an mtls server connection between the
+// socket and the line protocol: bytes read from the socket go into mtls and the
+// decrypted lines come out, and what the session writes is encrypted into the
+// same output queue. mtls never touches the socket; the handshake is driven by
+// the same IO events. The greeting is sent once the handshake is done.
+//
 // Nothing in a handler blocks. Logins, signups, every command (meodb, Argon2id,
 // VFS file IO) and the end of an upload run as jobs on alph's worker pool
 // (jobs.mettle, alph_offload): the session sends a copy of what the job needs,
@@ -26,6 +32,7 @@ import "std/conv";
 import "std/arena";
 import "std/strbuf";
 import "alph/alph";
+import "mtls/mtls";
 import "freedrs/status";
 import "freedrs/auth/auth";
 import "freedrs/db/store";
@@ -71,6 +78,9 @@ struct FdSession {
   up_len: int64;
   up_cap: int64;
   up_over: bool;
+  tls: MtlsConn*;      // the TLS connection, or 0 for plain TCP
+  tls_ready: bool;     // the handshake is done and the greeting queued
+  tls_closed: bool;    // close_notify is queued
 }
 
 // ---- output ----
@@ -78,10 +88,40 @@ struct FdSession {
 const OUT_LIMIT: int64 = 33554432;   // a 16 MiB file is 22.4 MB of base64
 /// Message to a session: end it (kick).
 export const TAG_KICK: int64 = ALPH_TAG_USER;
+/// Message a session sends itself: read again (TLS keeps decrypted bytes that
+/// the socket will not announce).
+const TAG_MORE: int64 = ALPH_TAG_USER + 1;
+
+/// Application data is encrypted in pieces of this size.
+const TLS_CHUNK: int64 = 65536;
+
+// Moves what mtls has queued for the socket (handshake messages, alerts,
+// encrypted data) into the output queue.
+fn tls_drain(st: FdSession*) {
+  var p: uint8* = (uint8*)0;
+  var n: int64 = mtls_conn_out_peek(st->tls, &p);
+  if (n <= 0) { return; }
+  if (alph_outq_push(st->ctx, &st->out, (rawptr)p, n) != ALPH_SENT) { st->broken = true; return; }
+  mtls_conn_out_done(st->tls, n);
+}
 
 fn out_put(st: FdSession*, p: rawptr, n: int64) {
   if (n <= 0 || st->broken) { return; }
-  if (alph_outq_push(st->ctx, &st->out, p, n) != ALPH_SENT) { st->broken = true; }
+  if (st->tls == (MtlsConn*)0) {
+    if (alph_outq_push(st->ctx, &st->out, p, n) != ALPH_SENT) { st->broken = true; }
+    return;
+  }
+  var off: int64 = 0;
+  while (off < n && !st->broken) {
+    var k: int64 = n - off;
+    if (k > TLS_CHUNK) { k = TLS_CHUNK; }
+    if (mtls_conn_write(st->tls, (uint8*)p + off, k) < 0) {
+      st->broken = true;
+      return;
+    }
+    tls_drain(st);
+    off = off + k;
+  }
 }
 
 fn out_str(st: FdSession*, s: string) {
@@ -133,6 +173,31 @@ fn make_room(st: FdSession*) -> bool {
     st->rcap = cap;
   }
   return true;
+}
+
+// Reads from the client into buf. Like alph_io_read: a byte count, 0 when the
+// client closed, ALPH_IO_AGAIN when nothing is there, or a negative error.
+// With TLS the bytes are decrypted first, and the handshake is driven from here.
+fn net_read(st: FdSession*, buf: rawptr, cap: int64) -> int64 {
+  if (st->tls == (MtlsConn*)0) { return alph_io_read(st->ctx, st->h, buf, cap); }
+  while (true) {
+    var n: int64 = mtls_conn_read(st->tls, (uint8*)buf, cap);
+    tls_drain(st);   // alerts and key updates the read produced
+    if (n > 0 || n == 0) { return n; }
+    if (n != (int64)MTLS_E_WANT_IO) { return -1; }   // the connection failed; the alert is queued
+    var p: uint8* = (uint8*)0;
+    var room: int64 = mtls_conn_in_space(st->tls, &p);
+    if (room <= 0) { return -1; }
+    var r: int64 = alph_io_read(st->ctx, st->h, (rawptr)p, room);
+    if (r == ALPH_IO_AGAIN || r <= 0) { return r; }
+    mtls_conn_in_commit(st->tls, r);
+    tls_drain(st);
+    if (!st->tls_ready && !mtls_conn_handshaking(st->tls) && mtls_conn_error(st->tls) == 0) {
+      st->tls_ready = true;
+      out_str(st, GREETING);
+    }
+  }
+  return -1;
 }
 
 // ---- login ----
@@ -363,6 +428,7 @@ fn handle_line(st: FdSession*, line: string) {
 // Ends the session: unregisters it; the runtime frees the heap and closes the handle.
 fn end_session(ctx: AlphCtx*, st: FdSession*) -> int64 {
   if (st->registered) { fd_clients_unregister(st->sess.client_id); st->registered = false; }
+  if (st->tls != (MtlsConn*)0) { mtls_conn_free(st->tls); st->tls = (MtlsConn*)0; }
   return alph_stop(ctx, ALPH_NORMAL);
 }
 
@@ -371,6 +437,12 @@ fn end_session(ctx: AlphCtx*, st: FdSession*) -> int64 {
 // comes as a message, and the next line waits for it), for output while some is waiting.
 fn settle(ctx: AlphCtx*, st: FdSession*) -> int64 {
   if (st->broken) { return end_session(ctx, st); }
+  if (st->tls != (MtlsConn*)0 && st->closing && st->job == 0 && !st->tls_closed) {
+    st->tls_closed = true;
+    mtls_conn_close(st->tls);   // close_notify
+    tls_drain(st);
+    if (st->broken) { return end_session(ctx, st); }
+  }
   var left: int64 = alph_outq_flush(ctx, &st->out, st->h);
   if (left < 0) { return end_session(ctx, st); }
   if (st->shutting) {
@@ -398,13 +470,18 @@ fn read_input(st: FdSession*) {
   var reads: int32 = 0;
   while (true) {
     run_lines(st);
-    if (st->closing || st->broken || st->job != 0 || reads >= 16) { return; }
+    if (st->closing || st->broken || st->job != 0) { return; }
+    if (reads >= 16) {
+      // The socket announces more input by itself; decrypted bytes waiting inside mtls do not.
+      if (st->tls != (MtlsConn*)0) { alph_send(st->ctx, st->ctx->self, TAG_MORE, 0); }
+      return;
+    }
     if (!make_room(st)) {
       out_str(st, "ERROR: Line too long\n");
       st->closing = true;
       return;
     }
-    var n: int64 = alph_io_read(st->ctx, st->h, (rawptr)(st->rbuf + st->rlen), st->rcap - st->rlen);
+    var n: int64 = net_read(st, (rawptr)(st->rbuf + st->rlen), st->rcap - st->rlen);
     if (n == ALPH_IO_AGAIN) { return; }
     if (n <= 0) { st->closing = true; return; }   // closed or failed: leave once the output is out
     st->rlen = st->rlen + n;
@@ -440,11 +517,22 @@ export fn fd_session_actor(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
     if (st->rbuf == 0) { return end_session(ctx, st); }
     st->rcap = RBUF_START;
     alph_tcp_nodelay(ctx, st->h, true);
-    out_str(st, GREETING);
+    if (g_tls_on) {
+      st->tls = mtls_server_new(&g_tls_cfg);   // the greeting follows the handshake
+      if (st->tls == (MtlsConn*)0) {
+        return end_session(ctx, st);
+      }
+    } else {
+      out_str(st, GREETING);
+    }
     return settle(ctx, st);
   }
   if (st->h == 0) { return ALPH_CONTINUE; }   // INIT: the handle has not arrived yet
   if (m->tag == TAG_KICK) { return end_session(ctx, st); }
+  if (m->tag == TAG_MORE) {
+    read_input(st);
+    return settle(ctx, st);
+  }
   if (st->job != 0 && m->ref == st->job) {
     job_answer(st, m);
     read_input(st);   // lines that arrived while the job ran

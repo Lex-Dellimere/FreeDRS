@@ -10,6 +10,8 @@ import "std/mem";
 import "std/conv";
 import "std/time";
 import "std/sync";
+import "log/log";
+import "mtls/mtls";
 import "freedrs/config/config";
 import "freedrs/db/store";
 import "freedrs/auth/auth";
@@ -19,6 +21,24 @@ export var g_cfg: FdConfig;
 export var g_db: FdDb;
 export var g_auth: FdAuth;
 export var g_vfs: FdVfs;
+
+/// TLS for client connections. Set once before the server starts and read-only
+/// after that; sessions use it when g_tls_on is true.
+export var g_tls_cfg: MtlsConfig;
+export var g_tls_on: bool = false;
+
+var g_log: LogLogger* = (LogLogger*)0;
+
+/// Creates the server's logger. Call once from the main thread before the
+/// server starts; more calls change nothing.
+export fn fd_log_init() {
+  if (g_log == (LogLogger*)0) { g_log = log_logger("freedrs"); }
+}
+
+/// The server's logger (set up by fd_log_init).
+export fn fd_log() -> LogLogger* {
+  return g_log;
+}
 
 export const FD_MAX_CLIENTS: int32 = 1024;
 

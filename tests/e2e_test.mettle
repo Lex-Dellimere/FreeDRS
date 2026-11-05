@@ -2,8 +2,11 @@
 // An embedded meodb (harness.mettle) and the real server code (alph acceptor and
 // session actors) in this process on an OS-chosen port; the client side is
 // src/client/conn.mettle, the library freedrs_client is built on. Script:
-// login, mkdir, upload, list, download, a path traversal, a guest refused,
-// quit. A test program: `mbuild test e2e`.
+// login, mkdir, upload, list, download, a path traversal, serverinfo, a guest
+// refused, quit. Then the same server over TLS (tests/data/tls_cert.pem is a
+// self-signed test certificate for localhost and 127.0.0.1, with its key): a
+// login and a 120 KB upload and download, and a client that does not trust the
+// certificate. A test program: `mbuild test e2e`.
 
 import "std/io";
 import "std/mem";
@@ -20,6 +23,7 @@ import "freedrs/vfs/vfs";
 import "freedrs/setup/setup";
 import "freedrs/server/state";
 import "freedrs/server/serve";
+import "freedrs/server/tls";
 import "freedrs/client/conn";
 
 // Reads reply lines up to CMD_END into one string (lines joined by \n).
@@ -92,6 +96,9 @@ fn run(addr: string) -> int32 {
   th_check("ping", has(cmd(a, "ping"), "PONG"));
   th_check("delete", has(cmd(a, "delete x.txt"), "SUCCESS: File deleted"));
   th_check("whoami", has(cmd(a, "whoami"), "(admin)"));
+  var info: string = cmd(a, "serverinfo");
+  th_check("serverinfo", has(info, "Server info:") && has(info, "  Uptime: ") && has(info, "  CPUs: ")
+                         && has(info, "  Memory: ") && has(info, " free of "));
   th_check("unknown", has(cmd(a, "frobnicate"), "ERROR: Unknown command"));
   th_check("quit", has(cmd(a, "quit"), "Goodbye!"));
   fd_conn_close();
@@ -105,8 +112,59 @@ fn run(addr: string) -> int32 {
   fd_conn_next_line(&line);
   th_check("guest list", has(cmd(a, "list"), "docs"));
   th_check("guest denied", has(cmd(a, "mkdir nope"), "Permission denied"));
+  th_check("guest serverinfo denied", has(cmd(a, "serverinfo"), "Permission denied"));
   fd_conn_close();
+  th_check("tls", run_tls(a, port) == 0);
   arena_free(a);
+  return 0;
+}
+
+// 120000 bytes of "ABC" as base64: one long line.
+fn big_payload(a: Arena*) -> string {
+  var b: StrBuf* = strbuf_new(a, 200000);
+  var i: int32 = 0;
+  while (i < 40000) { strbuf_append_string(b, "QUJD"); i = i + 1; }
+  return strbuf_finish_string(b);
+}
+
+// The server serves TLS from here on (the plain script is done). The client is
+// pointed at the test certificate as its only trusted root.
+fn run_tls(a: Arena*, port: int64) -> int32 {
+  var msg: string = "";
+  var cert: string = "tests/data/tls_cert.pem";
+  var rc: int32 = fd_tls_enable(cert, "tests/data/tls_key.pem");
+  th_check("tls enable", rc == 0);
+  th_check("tls missing key", fd_tls_enable(cert, "tests/data/no_such_key.pem") != 0);
+  th_check("tls enable again", fd_tls_enable(cert, "tests/data/tls_key.pem") == 0);
+  th_check("tls missing ca", !fd_conn_use_tls("tests/data/no_such_ca.pem", &msg));
+  th_check("tls client setup", fd_conn_use_tls(cert, &msg));
+
+  var line: string;
+  th_check("tls connect", fd_conn_open("127.0.0.1", (int32)port, false, &msg));
+  th_check("tls greeting 1", fd_conn_next_line(&line) && has(line, "Distributed File System"));
+  th_check("tls greeting 2", fd_conn_next_line(&line) && has(line, "login <user> <pass>"));
+  fd_conn_send_line("login admin admin password");
+  th_check("tls login", fd_conn_next_line(&line) && line == "SUCCESS: Welcome back, admin [admin]");
+  th_check("tls help prompt", fd_conn_next_line(&line) && has(line, "'help'"));
+  th_check("tls whoami", has(cmd(a, "whoami"), "(admin)"));
+
+  var data: string = big_payload(a);
+  fd_conn_send_line("upload big.bin");
+  th_check("tls ready", fd_conn_next_line(&line) && has(line, "READY:"));
+  fd_conn_send_line(data);
+  fd_conn_send_line("EOF");
+  th_check("tls uploaded", has(reply(a), "SUCCESS: File uploaded: big.bin [file] 120000B"));
+  var dl: string = cmd(a, "download big.bin");
+  th_check("tls download", has(dl, "FILE_DATA:\n{data}\nEND_FILE\nSUCCESS: File sent"));
+  th_check("tls delete", has(cmd(a, "delete big.bin"), "SUCCESS: File deleted"));
+  th_check("tls quit", has(cmd(a, "quit"), "Goodbye!"));
+  fd_conn_close();
+
+  // a certificate the client does not trust is refused
+  th_check("tls other ca", fd_conn_use_tls("tests/data/other_cert.pem", &msg));
+  th_check("tls untrusted refused", !fd_conn_open("127.0.0.1", (int32)port, false, &msg));
+  th_check("tls untrusted message", has(msg, "TLS handshake failed"));
+  fd_conn_close();
   return 0;
 }
 

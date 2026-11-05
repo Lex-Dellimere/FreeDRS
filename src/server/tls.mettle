@@ -1,0 +1,21 @@
+// freedrs/server/tls: switches on TLS for the server (mtls).
+//
+// The certificate chain and key are PEM files. The config in state.mettle is
+// shared by every session, so call this before the server starts.
+
+import "mtls/mtls";
+import "freedrs/server/state";
+
+/// Loads the certificate chain (leaf first) and private key and turns TLS on
+/// for new connections. returns: MTLS_OK, or an mtls error code
+/// (mtls_err_text gives the words).
+export fn fd_tls_enable(cert_path: string, key_path: string) -> int32 {
+  mtls_config_init(&g_tls_cfg);
+  var rc: int32 = mtls_config_load_cert_files(&g_tls_cfg, cert_path, key_path);
+  if (rc != MTLS_OK) {
+    mtls_config_free(&g_tls_cfg);
+    return rc;
+  }
+  g_tls_on = true;
+  return MTLS_OK;
+}

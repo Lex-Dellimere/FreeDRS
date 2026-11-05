@@ -1,6 +1,6 @@
 # FreeDRS wire protocol
 
-Line-based text over TCP (default port 5555), `\n`-terminated UTF-8.
+Line-based text over TCP (default port 5555), `\n`-terminated UTF-8. The server can also run the same protocol inside TLS (`--tls-cert` and `--tls-key`); nothing in the protocol changes, the greeting is sent once the TLS handshake is done.
 
 **Connect / auth phase**. Server sends two greeting lines, then loops reading lines:
 - `=== Distributed File System ===` then `Available: login <user> <pass> OR signup <user> <pass> OR guest`
@@ -25,6 +25,7 @@ Line-based text over TCP (default port 5555), `\n`-terminated UTF-8.
 | `help` | `Available Commands:` / `====` + role's command list (or `All commands available (admin)`) + examples |
 | `refresh` | `SUCCESS: File system metadata reloaded` |
 | `listclients` | `Connected clients:` + `  Client #<id>: <user> [<role>]` lines, or `No clients connected` |
+| `serverinfo` | `Server info:` then `  Uptime: <d>d <h>h <m>m`, `  CPUs: <n>`, `  Memory: <used> used of <total>` and `  Disk: <free> free of <total> (<mount>)`, the file system that holds the VFS root. A value that cannot be read is `unavailable` |
 | `clientinfo <id>` | `Client #<id>: <user> (connected: <date>)` / `ERROR: Client not found` / `ERROR: Invalid client ID` |
 | `kick <id>` | `SUCCESS: Client #<id> kicked.` (closes the session) |
 | `setrole <user> <role>` | `SUCCESS: Role updated for <user>` / `ERROR: User not found` |

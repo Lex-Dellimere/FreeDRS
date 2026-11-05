@@ -1,53 +1,99 @@
-// freedrs_setup: first-run tool. Connects to the meodb server,
-// creates the tables, the default roles and the admin user.
+// freedrs_setup: first-run tool. Asks for the port, the files directory and
+// the admin password, writes server_config.json, then connects to the meodb
+// server and creates the tables, the default roles and the admin user.
 //
 //   freedrs_setup [--meodb IP:PORT] [--admin-user NAME]
 //
-// It asks for the admin password on stdin, with echo off on a terminal; a pipe
-// works too: `printf 'secret-pass\n' | freedrs_setup`.
+// The port and directory prompts show their defaults in brackets (the values
+// from an existing server_config.json, else 5555 and dfs_root); an empty
+// answer keeps the default. The admin password is read with echo off on a
+// terminal. A pipe works too, one answer per line: port, directory, password.
+//   printf '\n\nsecret-pass\n' | freedrs_setup
 // The meodb address defaults to 127.0.0.1:5490 (FD_DEFAULT_MEODB).
-//
-// TODO: ask for the port and root directory and save server_config.json once a
-// JSON writer is available. For now config comes from the defaults.
 
 import "std/io";
 import "std/mem";
 import "std/conv";
+import "std/fs";
 import "std/term";
 import "std/term_os";
+import "args/args";
+import "freedrs/version";
 import "freedrs/status";
 import "freedrs/config/config";
 import "freedrs/auth/auth";
 import "freedrs/db/store";
 import "freedrs/setup/setup";
 
-fn cstr_view(p: cstring) -> string {
-  return str_from_cstr(p);
+const CONFIG_FILE: string = "server_config.json";
+
+var g_line: uint8[1100];
+
+// Asks one question; an empty answer (or end of input) gives `def`. The answer
+// is a view into a static buffer, valid until the next call.
+fn ask(question: string, def: string) -> string {
+  print("{question} [{def}]: ");
+  var line: string = read_line_stdin((cstring)&g_line[0], 1100);
+  var t: string = str_trim(line);
+  if (t.length == 0) { return def; }
+  return t;
 }
 
-fn main(argc: int32, argv: cstring*) -> int32 {
+fn main() -> int32 {
+  var a: Args;
+  args_init(&a, "freedrs_setup", "FreeDRS first-run setup: config file, roles and admin user");
+  args_version(&a, FD_VERSION);
+  var meodb: string = "";
+  args_str(&a, &meodb, 0, "meodb", "", "address of the meodb server (default: 127.0.0.1:5490)");
+  args_metavar(&a, "IP:PORT");
+  var admin_override: string = "";
+  args_str(&a, &admin_override, 0, "admin-user", "", "name of the admin user (default: admin)");
+  args_metavar(&a, "NAME");
+  var code: int32 = args_run(&a);
+  if (code >= 0) { return code; }
+
   var cfg: FdConfig;
   fd_config_defaults(&cfg);
-  var admin_override: string = "";
-  var i: int32 = 1;
-  while (i < argc) {
-    var arg: string = cstr_view(argv[i]);
-    if (arg == "--meodb" && i + 1 < argc) {
-      if (fd_config_set_meodb(&cfg, cstr_view(argv[i + 1])) != FD_OK) {
-        println_err("freedrs_setup: bad --meodb address");
-        return 2;
-      }
-      i = i + 2;
-    } else if (arg == "--admin-user" && i + 1 < argc) {
-      admin_override = cstr_view(argv[i + 1]);
-      i = i + 2;
-    } else {
-      println_err("usage: freedrs_setup [--meodb IP:PORT] [--admin-user NAME]");
-      return 2;
+  if (fs_exists(CONFIG_FILE)) {
+    var lrc: int32 = fd_config_load(&cfg, CONFIG_FILE);
+    if (lrc != FD_OK) {
+      println_err("freedrs_setup: cannot read {CONFIG_FILE}: {fd_status_text(lrc)}");
+      return 1;
     }
   }
+  if (meodb.length > 0 && fd_config_set_meodb(&cfg, meodb) != FD_OK) {
+    println_err("freedrs_setup: bad --meodb address");
+    return 2;
+  }
+  if (admin_override.length > 0 && fd_config_set_admin_user(&cfg, admin_override) != FD_OK) {
+    println_err("freedrs_setup: bad --admin-user name");
+    return 2;
+  }
+
+  // Ask for everything before touching the database.
+  var port_answer: string = ask("Port", "{cfg.port}");
+  var port: int64 = str_to_i64_or(port_answer, -1);
+  if (port < 1 || port > 65535 || fd_config_set_port(&cfg, port) != FD_OK) {
+    println_err("freedrs_setup: the port must be a number from 1 to 65535");
+    return 2;
+  }
+  var root_answer: string = ask("Files directory", fd_config_root(&cfg));
+  if (fd_config_set_root(&cfg, root_answer) != FD_OK) {
+    println_err("freedrs_setup: bad directory name");
+    return 2;
+  }
   var admin_user: string = fd_config_admin_user(&cfg);
-  if (admin_override.length > 0) { admin_user = admin_override; }
+  var prompt: string = "Admin user [{admin_user}] password (8+ characters): ";
+  var buf: uint8[1100];
+  var pw: string;
+  if (term_is_tty(0)) {
+    var n: int64 = term_read_secret(prompt, &buf[0], 1099);
+    if (n < 0) { n = 0; }
+    pw = str_from_bytes((cstring)&buf[0], n);
+  } else {
+    print(prompt);
+    pw = read_line_stdin((cstring)&buf[0], 1100);
+  }
 
   var db: FdDb;
   var rc: int32 = fd_db_open(&db, fd_config_meodb(&cfg), "");
@@ -64,18 +110,6 @@ fn main(argc: int32, argv: cstring*) -> int32 {
     fd_db_close(&db);
     return 1;
   }
-
-  var prompt: string = "Admin user [{admin_user}] password (8+ characters): ";
-  var buf: uint8[1100];
-  var pw: string;
-  if (term_is_tty(0)) {
-    var n: int64 = term_read_secret(prompt, &buf[0], 1099);
-    if (n < 0) { n = 0; }
-    pw = str_from_bytes((cstring)&buf[0], n);
-  } else {
-    print(prompt);
-    pw = read_line_stdin((cstring)&buf[0], 1100);
-  }
   rc = fd_setup_run(&auth, admin_user, pw);
   memset((rawptr)&buf[0], 0, 1100);
   fd_db_close(&db);
@@ -83,6 +117,12 @@ fn main(argc: int32, argv: cstring*) -> int32 {
     println_err("freedrs_setup: failed: {fd_status_text(rc)}");
     return 1;
   }
+  rc = fd_config_save(&cfg, CONFIG_FILE);
+  if (rc != FD_OK) {
+    println_err("freedrs_setup: cannot write {CONFIG_FILE}: {fd_status_text(rc)}");
+    return 1;
+  }
   println("Setup complete: roles admin and guest, admin user '{admin_user}'.");
+  println("Wrote {CONFIG_FILE} (port {cfg.port}, files in {fd_config_root(&cfg)}).");
   return 0;
 }

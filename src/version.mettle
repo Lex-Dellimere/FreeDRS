@@ -1,0 +1,3 @@
+// freedrs/version: the version the programs report with --version.
+
+export const FD_VERSION: string = "0.1.0";

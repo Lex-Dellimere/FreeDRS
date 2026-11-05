@@ -6,13 +6,15 @@
 // Unknown keys (such as "db" or "adminPass") are skipped; the admin password
 // is never read from or kept in the config.
 //
-// Parsing uses the json pull reader. All strings are copied into fixed buffers
-// inside FdConfig, so a config is a plain value with no owner.
+// Parsing uses the json pull reader and saving uses the codec JSON writer. All
+// strings are copied into fixed buffers inside FdConfig, so a config is a plain
+// value with no owner.
 
 import "std/mem";
 import "std/conv";
 import "std/file";
 import "json/json";
+import "codec/json/write";
 import "freedrs/status";
 
 export const FD_CFG_STR_CAP: int32 = 256;
@@ -62,6 +64,13 @@ export fn fd_config_meodb(c: FdConfig*) -> string {
 /// The admin user name for the setup tool (a view into c).
 export fn fd_config_admin_user(c: FdConfig*) -> string {
   return str_from_bytes((cstring)&c->admin_user[0], (int64)c->admin_user_len);
+}
+
+/// Sets the admin user name. FD_E_INVALID when empty or too long.
+export fn fd_config_set_admin_user(c: FdConfig*, name: string) -> int32 {
+  if (c == 0 || name.length == 0) { return FD_E_INVALID; }
+  if (!fd_cfg_put(&c->admin_user[0], &c->admin_user_len, name)) { return FD_E_INVALID; }
+  return FD_OK;
 }
 
 /// Sets the meodb address ("ip:port"). FD_E_INVALID when empty or too long.
@@ -183,4 +192,53 @@ export fn fd_config_load(c: FdConfig*, path: string) -> int32 {
   return rc;
 }
 
-// TODO: fd_config_save, once there is a JSON writer.
+/// Writes the config as a server_config.json document (indented, with a final
+/// newline) into b, which must be initialised with codec_buf_init.
+///
+/// returns: FD_OK; FD_E_NOMEM when the writer fails
+export fn fd_config_to_json(c: FdConfig*, b: CodecBuf*) -> int32 {
+  if (c == 0 || b == 0) { return FD_E_USAGE; }
+  var w: CodecJson;
+  codec_json_init(&w, b);
+  codec_json_pretty(&w, 2);
+  codec_json_object(&w);
+  codec_json_field_int(&w, "port", c->port);
+  codec_json_field_string(&w, "resourcesPath", fd_config_root(c));
+  codec_json_field_string(&w, "meodb", fd_config_meodb(c));
+  codec_json_field_string(&w, "adminUser", fd_config_admin_user(c));
+  codec_json_end(&w);
+  if (codec_json_finish(&w) != CODEC_OK) { return FD_E_NOMEM; }
+  codec_buf_byte(b, (uint8)10);
+  return FD_OK;
+}
+
+/// Saves the config to `path` as JSON. The document is written to a temporary
+/// file next to it and renamed over it, so a failed save leaves the old file.
+///
+/// returns: FD_OK; FD_E_IO (cannot write or rename); FD_E_NOMEM
+export fn fd_config_save(c: FdConfig*, path: string) -> int32 {
+  if (c == 0 || path.length == 0) { return FD_E_USAGE; }
+  var b: CodecBuf;
+  codec_buf_init(&b, 512);
+  var rc: int32 = fd_config_to_json(c, &b);
+  if (rc != FD_OK) { codec_buf_free(&b); return rc; }
+  var tmp: string = path + ".tmp";
+  var fd: int64 = file_open(tmp, FILE_WRITE | FILE_CREATE | FILE_TRUNCATE);
+  if (fd < 0) { codec_buf_free(&b); return FD_E_IO; }
+  var doc: string = codec_buf_view(&b);
+  var off: int64 = 0;
+  var total: int64 = (int64)doc.length;
+  while (off < total) {
+    var w: int64 = file_write_at(fd, (uint8*)doc.chars + off, total - off, off);
+    if (w <= 0) { break; }
+    off = off + w;
+  }
+  var ok: bool = off == total && file_sync(fd) >= 0;
+  file_close(fd);
+  codec_buf_free(&b);
+  if (!ok || file_rename(tmp, path) < 0) {
+    file_remove(tmp);
+    return FD_E_IO;
+  }
+  return FD_OK;
+}

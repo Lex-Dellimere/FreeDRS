@@ -1,11 +1,14 @@
 // freedrs_client: command line client.
 //
 //   freedrs_client [HOST[:PORT]] [--guest | --user NAME [--pass PASSWORD]]
+//                  [--tls [--ca FILE]]
 //
 // HOST defaults to 127.0.0.1, PORT to 5555. Without --user/--guest it asks
 // whether to log in, sign up or enter as guest. Passwords are typed with echo
 // off when stdin is a terminal. Then a prompt: every line is sent
-// to the server and the reply printed up to CMD_END. Local commands:
+// to the server and the reply printed up to CMD_END. With --tls the connection
+// is encrypted and the server's certificate is checked against the roots in
+// the --ca file, or the system roots without it. Local commands:
 //   status                      connection state
 //   upload <local> [remote]     read the local file, send it base64 encoded
 //   download <remote> [local]   fetch a file and write it locally
@@ -21,6 +24,8 @@ import "std/term";
 import "std/term_os";
 import "std/encoding";
 import "std/socket";
+import "args/args";
+import "freedrs/version";
 import "freedrs/client/conn";
 
 const LOCAL_MAX: int64 = 16777216;   // the server's file size limit
@@ -42,7 +47,9 @@ fn read_input(prompt: string, out: string*) -> bool {
 }
 
 // Like read_input, for a password: echo is off when stdin is a terminal.
-// A pipe or file is read as usual.
+// A pipe or file is read as usual. Ctrl-C at the prompt: term_read_secret puts
+// the terminal back first, then the program gets SIGINT and ends, so echo is
+// never left off.
 fn read_secret(prompt: string, out: string*) -> bool {
   if (!term_is_tty(0)) { return read_input(prompt, out); }
   var n: int64 = term_read_secret(prompt, &g_line[0], 2047);
@@ -365,27 +372,51 @@ fn repl() -> int32 {
   return 0;
 }
 
-fn main(argc: int32, argv: cstring*) -> int32 {
-  var user: string = "";
-  var pass: string = "";
-  var guest: bool = false;
+fn main() -> int32 {
+  var a: Args;
+  args_init(&a, "freedrs_client", "FreeDRS command line client");
+  args_version(&a, FD_VERSION);
   var hostport: string = "";
-  var i: int32 = 1;
-  while (i < argc) {
-    var arg: string = str_from_cstr(argv[i]);
-    if (arg == "--guest") { guest = true; i = i + 1; }
-    else if (arg == "--user" && i + 1 < argc) { user = str_from_cstr(argv[i + 1]); i = i + 2; }
-    else if (arg == "--pass" && i + 1 < argc) { pass = str_from_cstr(argv[i + 1]); i = i + 2; }
-    else if (str_starts_with(arg, "-") == 0 && hostport.length == 0) { hostport = arg; i = i + 1; }
-    else {
-      println_err("usage: freedrs_client [HOST[:PORT]] [--guest | --user NAME [--pass PASSWORD]]");
-      return 2;
-    }
+  args_pos_opt(&a, &hostport, "HOST[:PORT]", "", "server to connect to (default: 127.0.0.1:5555)");
+  var guest: bool = false;
+  args_flag(&a, &guest, 0, "guest", "enter as a guest");
+  var user: string = "";
+  args_str(&a, &user, 0, "user", "", "log in as this user");
+  args_metavar(&a, "NAME");
+  var pass: string = "";
+  args_str(&a, &pass, 0, "pass", "", "the password for --user (asked for when left out)");
+  args_metavar(&a, "PASSWORD");
+  var use_tls: bool = false;
+  args_flag(&a, &use_tls, 0, "tls", "connect over TLS");
+  var ca: string = "";
+  args_str(&a, &ca, 0, "ca", "", "PEM file with the CA certificates to trust (default: the system roots); needs --tls");
+  args_metavar(&a, "FILE");
+  var code: int32 = args_run(&a);
+  if (code >= 0) { return code; }
+
+  if (guest && user.length > 0) {
+    println_err("freedrs_client: use either --guest or --user");
+    return 2;
+  }
+  if (pass.length > 0 && user.length == 0) {
+    println_err("freedrs_client: --pass needs --user");
+    return 2;
+  }
+  if (ca.length > 0 && !use_tls) {
+    println_err("freedrs_client: --ca needs --tls");
+    return 2;
   }
   if (hostport.length > 0) {
     match (net_split_host_port(hostport, 5555)) {
       case Ok(hp): { g_host = hp.host; g_port = hp.port; }
       case Err(why): { println_err("freedrs_client: bad address: {why}"); return 2; }
+    }
+  }
+  if (use_tls) {
+    var msg: string = "";
+    if (!fd_conn_use_tls(ca, &msg)) {
+      println_err("freedrs_client: {msg}");
+      return 2;
     }
   }
   var creds: Creds;

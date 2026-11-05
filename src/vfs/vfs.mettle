@@ -42,6 +42,11 @@ export struct FdVfs {
   lock: SyncMutex;
 }
 
+/// The root directory on disk (a view into v).
+export fn fd_vfs_root(v: FdVfs*) -> string {
+  return str_from_bytes((cstring)&v->root[0], (int64)v->root_len);
+}
+
 /// A virtual path in a fixed buffer.
 export struct FdVPath {
   buf: uint8[512];

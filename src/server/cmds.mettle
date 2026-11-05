@@ -15,6 +15,8 @@ import "std/time";
 import "std/arena";
 import "std/strbuf";
 import "std/encoding";
+import "std/fs";
+import "sysinfo";
 import "freedrs/status";
 import "freedrs/config/config";
 import "freedrs/auth/roles";
@@ -398,6 +400,102 @@ fn cmd_kick(s: FdSess*, args: string, b: StrBuf*) {
   ln(b, " kicked.");
 }
 
+// "12.3 GiB": a byte count with one decimal.
+fn put_size(b: StrBuf*, bytes: int64) {
+  var unit: int64 = 1;
+  var name: string = "B";
+  if (bytes >= 1099511627776) { unit = 1099511627776; name = "TiB"; }
+  else if (bytes >= 1073741824) { unit = 1073741824; name = "GiB"; }
+  else if (bytes >= 1048576) { unit = 1048576; name = "MiB"; }
+  else if (bytes >= 1024) { unit = 1024; name = "KiB"; }
+  if (unit == 1) {
+    strbuf_append_int(b, bytes);
+  } else {
+    var tenths: int64 = bytes * 10 / unit;
+    strbuf_append_int(b, tenths / 10);
+    put(b, ".");
+    strbuf_append_int(b, tenths % 10);
+  }
+  put(b, " ");
+  put(b, name);
+}
+
+fn put_uptime(b: StrBuf*, secs: int64) {
+  var days: int64 = secs / 86400;
+  var hours: int64 = (secs % 86400) / 3600;
+  var mins: int64 = (secs % 3600) / 60;
+  if (days > 0) {
+    strbuf_append_int(b, days);
+    put(b, "d ");
+  }
+  strbuf_append_int(b, hours);
+  put(b, "h ");
+  strbuf_append_int(b, mins);
+  put(b, "m");
+}
+
+// The mounted file system that holds `path`: the longest mount point that is
+// a prefix of it. -1 when there is none.
+fn fs_holding(fs: SysinfoFs*, n: int32, path: string) -> int32 {
+  var best: int32 = -1;
+  var best_len: int64 = -1;
+  var i: int32 = 0;
+  while (i < n) {
+    var m: string = fs[i].mount;
+    var len: int64 = (int64)m.length;
+    var inside: bool = str_starts_with(path, m) != 0
+                    && ((int64)path.length == len || m == "/" || path.chars[len] == '/');
+    if (inside && len > best_len) { best = i; best_len = len; }
+    i = i + 1;
+  }
+  return best;
+}
+
+fn cmd_serverinfo(b: StrBuf*) {
+  var si: Sysinfo* = (Sysinfo*)calloc(1, (int64)sizeof(Sysinfo));
+  if (si == 0) { err_rc(b, FD_E_NOMEM); return; }
+  var what: uint32 = (uint32)(SYSINFO_SYSTEM | SYSINFO_CPU | SYSINFO_MEM | SYSINFO_DISK);
+  if (sysinfo_open(si, what) < 0) {
+    free((rawptr)si);
+    ln(b, "ERROR: System information is not available");
+    return;
+  }
+  ln(b, "Server info:");
+  put(b, "  Uptime: ");
+  if (si->system.status == SYSINFO_OK) { put_uptime(b, (int64)si->system.uptime_s); } else { put(b, "unavailable"); }
+  put(b, "\n  CPUs: ");
+  if (si->cpu.status == SYSINFO_OK) { strbuf_append_int(b, (int64)si->cpu.logical); } else { put(b, "unavailable"); }
+  put(b, "\n  Memory: ");
+  if (si->mem.status == SYSINFO_OK) {
+    put_size(b, si->mem.used);
+    put(b, " used of ");
+    put_size(b, si->mem.total);
+  } else {
+    put(b, "unavailable");
+  }
+  var real: uint8[1024];
+  var rl: int64 = fs_realpath(fd_vfs_root(&g_vfs), &real[0], 1024);
+  var at: int32 = -1;
+  if (rl > 0 && si->disk.status == SYSINFO_OK) {
+    at = fs_holding(si->disk.fs, si->disk.n_fs, str_from_bytes((cstring)&real[0], rl));
+  }
+  put(b, "\n  Disk: ");
+  if (at >= 0) {
+    var f: SysinfoFs* = &si->disk.fs[at];
+    put_size(b, f->avail);
+    put(b, " free of ");
+    put_size(b, f->total);
+    put(b, " (");
+    put(b, f->mount);
+    put(b, ")");
+  } else {
+    put(b, "unavailable");
+  }
+  put(b, "\n");
+  sysinfo_close(si);
+  free((rawptr)si);
+}
+
 fn cmd_setrole(args: string, b: StrBuf*) {
   var w: FdWords = fd_next_word(args);
   if (w.word.length == 0 || w.rest.length == 0) { ln(b, "ERROR: Usage: setrole <username> <role>"); return; }
@@ -510,6 +608,7 @@ export fn fd_cmd_run(s: FdSess*, line: string, b: StrBuf*, a: Arena*) {
   }
   else if (verb == "help") { cmd_help(s, b); }
   else if (verb == "refresh") { cmd_refresh(b); }
+  else if (verb == "serverinfo") { cmd_serverinfo(b); }
   else if (verb == "listclients") { cmd_listclients(b, a); }
   else if (verb == "clientinfo") { cmd_clientinfo(args, b); }
   else if (verb == "kick") { cmd_kick(s, args, b); }
