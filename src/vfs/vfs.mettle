@@ -32,7 +32,7 @@ import "std/conv";
 import "std/file";
 import "std/fs";
 import "std/sync";
-import "crypto/crypto";
+import "cryptex/cryptex";
 import "freedrs/status";
 import "freedrs/auth/roles";
 import "freedrs/db/store";

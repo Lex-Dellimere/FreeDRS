@@ -19,7 +19,7 @@ import "std/strbuf";
 import "std/file";
 import "std/fs";
 import "std/encoding";
-import "crypto/crypto";
+import "cryptex/cryptex";
 import "press/press";
 import "harness";
 import "freedrs/status";

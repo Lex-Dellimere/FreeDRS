@@ -29,7 +29,7 @@ import "std/sync";
 import "std/file";
 import "std/strbuf";
 import "std/encoding";
-import "crypto/crypto";
+import "cryptex/cryptex";
 import "press/press";
 import "log/log";
 import "freedrs/status";

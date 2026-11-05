@@ -21,7 +21,7 @@ import "std/fs";
 import "std/arena";
 import "std/strbuf";
 import "std/encoding";
-import "crypto/crypto";
+import "cryptex/cryptex";
 import "press/press";
 import "freedrs/client/conn";
 
