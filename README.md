@@ -34,7 +34,7 @@ docs/                wire protocol
 
 ## Build and run
 
-All of it goes through [mbuild](https://github.com/Lex-Dellimere/mbuild). The path dependencies expect the Mettle workspace layout (`../meodb`, `../flux_orm`, `../raize_auth`, `../cryptex`, `../alph`, `../codec`, `../args`, `../log`, `../sysinfo`, `../mtls` next to this repo).
+All of it goes through [mbuild](https://github.com/Lex-Dellimere/mbuild). The path dependencies expect the Mettle workspace layout (`../meodb`, `../flux_orm`, `../raize_web/libs/auth`, `../cryptex`, `../alph`, `../codec`, `../args`, `../log`, `../sysinfo`, `../mtls` next to this repo).
 
 ```
 mbuild build
