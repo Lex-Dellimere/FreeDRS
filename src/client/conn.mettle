@@ -11,10 +11,10 @@
 // One connection per process (module globals).
 //
 // With fd_conn_use_tls the connection runs over TLS (mtls). The handshake is
-// done in fd_conn_open, before the threads start. After that the reader,
-// heartbeat and REPL threads share one mtls connection, which belongs to one
-// thread at a time, so every call into it is made under g_tls_lock; only the
-// blocking socket read is done outside the lock, into a buffer of the reader's.
+// done in fd_conn_open, before the threads start. After that the reader reads
+// the one MtlsStream while the heartbeat and REPL threads write to it; mtls
+// allows that without a lock of ours. fd_conn_close stops the reader with
+// mtls_stream_shutdown, joins both threads, then closes the stream.
 
 import "std/mem";
 import "std/conv";
@@ -49,101 +49,54 @@ var g_ping_sent_ms: int64;    // 0 = no PING waiting for its PONG
 var g_heartbeat: bool;
 var g_gen: int64;             // bumps on every open: old threads stop
 
+var g_reader: int64;          // thread handles, joined by fd_conn_close
+var g_hb: int64;
+
 var g_use_tls: bool;
 var g_tls_cfg: MtlsConfig;
 var g_tls_roots: MtlsRoots;
-var g_tls_lock: SyncMutex;    // guards g_tls and every call into it
-var g_tls: MtlsConn*;         // the open connection when TLS is on, else 0
-var g_raw: uint8[16384];      // socket bytes read but not yet taken by mtls
-var g_raw_pos: int64;
-var g_raw_len: int64;
+var g_stream: MtlsStream;     // the open connection when g_tls_on
+var g_tls_on: bool;
 const HANDSHAKE_MS: int64 = 10000;
 
 // ---- socket I/O, plain or TLS ----
 
-// Sends what mtls has queued. Call with g_tls_lock held.
-fn tls_flush() -> bool {
-  var p: uint8* = (uint8*)0;
-  var n: int64 = mtls_conn_out_peek(g_tls, &p);
-  while (n > 0) {
-    if (sock_send_all(g_sock, p, n) < 0) { return false; }
-    mtls_conn_out_done(g_tls, n);
-    n = mtls_conn_out_peek(g_tls, &p);
-  }
-  return true;
-}
-
 // Sends n bytes (encrypted when TLS is on). false when the connection is gone.
 fn net_send(p: uint8*, n: int64) -> bool {
-  if (!g_use_tls) { return sock_send_all(g_sock, p, n) >= 0; }
-  var ok: bool = true;
-  sync_mutex_lock(&g_tls_lock);
-  if (g_tls == (MtlsConn*)0) {
-    ok = false;
-  } else {
-    var off: int64 = 0;
-    while (ok && off < n) {
-      var k: int64 = n - off;
-      if (k > 65536) { k = 65536; }
-      ok = mtls_conn_write(g_tls, p + off, k) >= 0 && tls_flush();
-      off = off + k;
-    }
-  }
-  sync_mutex_unlock(&g_tls_lock);
-  return ok;
+  if (!g_tls_on) { return sock_send_all(g_sock, p, n) >= 0; }
+  return mtls_stream_write(&g_stream, p, n) >= 0;
 }
 
 // Reads up to cap bytes like sock_recv: a count, 0 when the server closed, or a
-// negative error. With TLS the bytes are decrypted. `gen` is the connection the
-// reader belongs to; a reader of an older connection gets an error.
-// Only the reader thread calls this, so g_raw (socket bytes mtls has not taken
-// yet) needs no lock of its own.
-fn net_recv(gen: int64, buf: uint8*, cap: int64) -> int64 {
-  if (!g_use_tls) { return sock_recv(g_sock, buf, cap); }
-  while (true) {
-    sync_mutex_lock(&g_tls_lock);
-    if (g_tls == (MtlsConn*)0 || gen != g_gen) { sync_mutex_unlock(&g_tls_lock); return -1; }
-    var fed: int64 = 0;
-    if (g_raw_pos < g_raw_len) {
-      fed = mtls_conn_feed(g_tls, &g_raw[0] + g_raw_pos, g_raw_len - g_raw_pos);
-      if (fed > 0) { g_raw_pos = g_raw_pos + fed; }
-    }
-    var n: int64 = mtls_conn_read(g_tls, buf, cap);
-    tls_flush();   // alerts and key updates the read produced
-    sync_mutex_unlock(&g_tls_lock);
-    if (n != (int64)MTLS_E_WANT_IO) { return n; }
-    if (fed > 0) { continue; }
-    if (g_raw_pos < g_raw_len) { return -1; }   // mtls takes no more and has nothing to give
-    var r: int64 = sock_recv(g_sock, &g_raw[0], 16384);
-    if (r == -(int64)NET_EINTR) { continue; }
-    if (r <= 0) { return r; }
-    g_raw_pos = 0;
-    g_raw_len = r;
-  }
-  return -1;
+// negative error. With TLS the bytes are decrypted. Only the reader thread
+// calls this.
+fn net_recv(buf: uint8*, cap: int64) -> int64 {
+  if (!g_tls_on) { return sock_recv(g_sock, buf, cap); }
+  return mtls_stream_read(&g_stream, buf, cap);
+}
+
+// Stops the connection so a blocked reader returns. Safe from any thread.
+fn net_shutdown() {
+  if (g_tls_on) { mtls_stream_shutdown(&g_stream); }
+  else { sock_shutdown(g_sock, NET_SHUT_BOTH); }
 }
 
 // Runs the TLS handshake on the connected socket. false (with *msg) on failure.
 fn tls_start(host: string, msg: string*) -> bool {
-  var st: MtlsStream;
-  memset((rawptr)&st, 0, (int64)sizeof(MtlsStream));
+  memset((rawptr)&g_stream, 0, (int64)sizeof(MtlsStream));
   sock_set_timeout(g_sock, HANDSHAKE_MS, HANDSHAKE_MS);
-  var rc: int32 = mtls_stream_client(&st, g_sock, &g_tls_cfg, host);
+  var rc: int32 = mtls_stream_client(&g_stream, g_sock, &g_tls_cfg, host);   // the socket stays ours
   sock_set_timeout(g_sock, 0, 0);
   if (rc != MTLS_OK) {
     var why: string = mtls_err_text(rc);
-    if (st.c != (MtlsConn*)0 && mtls_conn_cert_error(st.c) != 0) {
-      why = "{why}: {mtls_cv_text(mtls_conn_cert_error(st.c))}";
+    if (g_stream.c != (MtlsConn*)0 && mtls_conn_cert_error(g_stream.c) != 0) {
+      why = "{why}: {mtls_cv_text(mtls_conn_cert_error(g_stream.c))}";
     }
     *msg = "TLS handshake failed ({why})";
-    mtls_stream_close(&st);   // does not close the socket
+    mtls_stream_close(&g_stream);
     return false;
   }
-  sync_mutex_lock(&g_tls_lock);
-  g_tls = st.c;
-  g_raw_pos = 0;
-  g_raw_len = 0;
-  sync_mutex_unlock(&g_tls_lock);
+  g_tls_on = true;
   return true;
 }
 
@@ -217,7 +170,7 @@ fn reader_thread(param: cstring) -> uint32 {
       buf = (uint8*)realloc((rawptr)buf, cap);
       if (buf == 0) { break; }
     }
-    var n: int64 = net_recv(gen, buf + len, cap - len);
+    var n: int64 = net_recv(buf + len, cap - len);
     if (n == -(int64)NET_EINTR) { continue; }
     if (n <= 0) { break; }
     len = len + n;
@@ -231,7 +184,7 @@ fn heartbeat_thread(param: cstring) -> uint32 {
   var gen: int64 = (int64)param;
   var last_ping: int64 = time_mono_ms();
   while (gen == g_gen) {
-    time_sleep_ms(500);
+    time_sleep_ms(50);
     if (gen != g_gen) { break; }
     var now: int64 = time_mono_ms();
     sync_mutex_lock(&g_lock);
@@ -241,7 +194,7 @@ fn heartbeat_thread(param: cstring) -> uint32 {
     if (closed) { break; }
     if (waiting != 0 && now - waiting > PONG_WITHIN_MS) {
       println_err("freedrs: no PONG from the server for 12 s, connection lost");
-      sock_shutdown(g_sock, NET_SHUT_BOTH);   // the reader sees the end
+      sock_shutdown(g_sock, NET_SHUT_BOTH);   // the reader sees the end; fd_conn_close finishes the job
       break;
     }
     if (waiting == 0 && now - last_ping >= PING_EVERY_MS) {
@@ -288,6 +241,7 @@ export fn fd_conn_open(host: string, port: int32, heartbeat: bool, msg: string*)
     case Ok(fd): { g_sock = fd; }
     case Err(e): { *msg = e.message; return false; }
   }
+  g_tls_on = false;
   if (g_use_tls && !tls_start(host, msg)) {
     sock_close(g_sock);
     g_sock = -1;
@@ -303,14 +257,11 @@ export fn fd_conn_open(host: string, port: int32, heartbeat: bool, msg: string*)
   g_busy = false;
   var gen: int64 = g_gen;
   sync_mutex_unlock(&g_lock);
-  var h: int64 = CreateThread(0, 0, &reader_thread, (cstring)gen, 0, 0);
-  if (h == 0) { tls_close(); sock_close(g_sock); g_sock = -1; *msg = "cannot start the reader thread"; return false; }
-  thread_detach(h);
+  g_reader = CreateThread(0, 0, &reader_thread, (cstring)gen, 0, 0);
+  if (g_reader == 0) { net_close(); *msg = "cannot start the reader thread"; return false; }
+  g_hb = 0;
   g_heartbeat = heartbeat;
-  if (heartbeat) {
-    var hb: int64 = CreateThread(0, 0, &heartbeat_thread, (cstring)gen, 0, 0);
-    if (hb != 0) { thread_detach(hb); }
-  }
+  if (heartbeat) { g_hb = CreateThread(0, 0, &heartbeat_thread, (cstring)gen, 0, 0); }
   return true;
 }
 
@@ -360,27 +311,28 @@ export fn fd_conn_free_line(s: string) {
   free((rawptr)s.chars);
 }
 
-// Ends the TLS connection with close_notify (best effort) and frees it.
-fn tls_close() {
-  sync_mutex_lock(&g_tls_lock);
-  if (g_tls != (MtlsConn*)0) {
-    mtls_conn_close(g_tls);
-    tls_flush();
-    mtls_conn_free(g_tls);
-    g_tls = (MtlsConn*)0;
+// Closes the stream (close_notify, best effort) and the socket. No thread may
+// be using the connection.
+fn net_close() {
+  if (g_tls_on) {
+    mtls_stream_close(&g_stream);
+    g_tls_on = false;
   }
-  sync_mutex_unlock(&g_tls_lock);
-}
-
-/// Closes the connection; the threads stop by themselves.
-export fn fd_conn_close() {
-  sync_mutex_lock(&g_lock);
-  g_gen = g_gen + 1;
-  sync_mutex_unlock(&g_lock);
-  tls_close();
   if (g_sock >= 0) {
-    sock_shutdown(g_sock, NET_SHUT_BOTH);
     sock_close(g_sock);
     g_sock = -1;
   }
+}
+
+/// Closes the connection: stops the reader, joins the reader and heartbeat
+/// threads, then closes the stream and the socket.
+export fn fd_conn_close() {
+  if (g_sock < 0) { return; }
+  sync_mutex_lock(&g_lock);
+  g_gen = g_gen + 1;
+  sync_mutex_unlock(&g_lock);
+  net_shutdown();
+  if (g_reader != 0) { thread_join_infinite(g_reader); thread_close(g_reader); g_reader = 0; }
+  if (g_hb != 0) { thread_join_infinite(g_hb); thread_close(g_hb); g_hb = 0; }
+  net_close();
 }
