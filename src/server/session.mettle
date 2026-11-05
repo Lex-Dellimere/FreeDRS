@@ -587,7 +587,14 @@ export fn fd_session_actor(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
     }
     st->rcap = RBUF_START;
     alph_tcp_nodelay(ctx, st->h, true);
-    log_info(fd_log(), "client connected", log_int("session", ctx->self), log_bool("tls", g_tls_on));
+    var ip: int64 = 0;
+    var port: int64 = 0;
+    var peer: string = "unknown";
+    if (alph_tcp_peer(ctx, st->h, &ip, &port) == 0) {
+      peer = "{(ip >> 24) & 255}.{(ip >> 16) & 255}.{(ip >> 8) & 255}.{ip & 255}:{port}";
+    }
+    log_info(fd_log(), "client connected", log_int("session", ctx->self), log_str("peer", peer),
+             log_bool("tls", g_tls_on));
     if (g_tls_on) {
       st->tls = mtls_server_new(&g_tls_cfg);   // the greeting follows the handshake
       if (st->tls == (MtlsConn*)0) {
